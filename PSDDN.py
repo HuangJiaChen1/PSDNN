@@ -5,51 +5,29 @@ import random
 import numpy as np
 from PIL import Image
 import argparse
+import pickle
+import time
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torchvision
+from torch.utils.data import Dataset
 from torchvision import transforms, models
-from torch.utils.data import Dataset, DataLoader, Subset
 
 from mat4py import loadmat  # pip install mat4py
 
-
-# ============================
-# Custom Collate Function
-# ============================
-
-def custom_collate(batch):
-    """
-    Collate function for the ShanghaiTechDataset.
-    - Stacks images and scalar values.
-    - Leaves variable-length items (points and pseudo_gt) as lists.
-    """
-    collated = {}
-    collated['image'] = torch.stack([b['image'] for b in batch], dim=0)
-    collated['points'] = [b['points'] for b in batch]  # leave as list
-    collated['pseudo_gt'] = [b['pseudo_gt'] for b in batch]  # leave as list (numpy arrays)
-    collated['gt_count'] = torch.tensor([b['gt_count'] for b in batch])
-    collated['difficulty'] = torch.tensor([b['difficulty'] for b in batch])
-    return collated
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
 
 
 # ============================
-# Helper Functions
+# Helper Functions (GPU version)
 # ============================
-
 def compute_euclidean_distance(p1, p2):
     return math.sqrt((p1[0] - p2[0]) ** 2 + (p1[1] - p2[1]) ** 2)
 
 
 def generate_pseudo_gt_from_points(points):
-    """
-    Given a list of points [(x,y), ...], compute a pseudo ground truth
-    bounding box for each point. The box is square, centered at the point,
-    with side length equal to the nearest-neighbor distance (or a default if only one point).
-    Returns an array of shape (N,4) in [x1, y1, x2, y2] format.
-    """
     pseudo_boxes = []
     default_size = 32.0
     for i, pt in enumerate(points):
@@ -65,16 +43,6 @@ def generate_pseudo_gt_from_points(points):
 
 
 def generate_anchors(feature_size, stride, scales, ratios):
-    """
-    Generate anchor boxes for a feature map.
-    Args:
-        feature_size: tuple (H, W) of the feature map.
-        stride: the stride (in pixels) of the feature map relative to the input image.
-        scales: list of scales (e.g., [32, 64, 128])
-        ratios: list of aspect ratios (e.g., [0.5, 1.0, 2.0])
-    Returns:
-        anchors: numpy array of shape (num_anchors, 4) in [x1, y1, x2, y2] format.
-    """
     anchors = []
     H, W = feature_size
     for i in range(H):
@@ -93,57 +61,52 @@ def generate_anchors(feature_size, stride, scales, ratios):
     return np.array(anchors, dtype=np.float32)
 
 
-def compute_iou(box1, box2):
-    """
-    Compute Intersection-over-Union (IoU) between two boxes.
-    Boxes: [x1, y1, x2, y2]
-    """
-    x1 = max(box1[0], box2[0])
-    y1 = max(box1[1], box2[1])
-    x2 = min(box1[2], box2[2])
-    y2 = min(box1[3], box2[3])
-    inter_area = max(0, x2 - x1) * max(0, y2 - y1)
-    area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
-    area2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
-    union_area = area1 + area2 - inter_area
-    if union_area == 0:
-        return 0
-    return inter_area / union_area
+def compute_iou_tensor(anchors, gt_boxes):
+    # anchors: (N,4), gt_boxes: (M,4)
+    N = anchors.shape[0]
+    M = gt_boxes.shape[0]
+    x1 = torch.max(anchors[:, None, 0], gt_boxes[None, :, 0])
+    y1 = torch.max(anchors[:, None, 1], gt_boxes[None, :, 1])
+    x2 = torch.min(anchors[:, None, 2], gt_boxes[None, :, 2])
+    y2 = torch.min(anchors[:, None, 3], gt_boxes[None, :, 3])
+    inter = torch.clamp(x2 - x1, min=0) * torch.clamp(y2 - y1, min=0)
+    area_anchor = (anchors[:, 2] - anchors[:, 0]) * (anchors[:, 3] - anchors[:, 1])
+    area_gt = (gt_boxes[:, 2] - gt_boxes[:, 0]) * (gt_boxes[:, 3] - gt_boxes[:, 1])
+    union = area_anchor[:, None] + area_gt[None, :] - inter + 1e-6
+    iou = inter / union
+    return iou
 
 
-def bbox_transform(anchor, gt_box):
-    """
-    Compute the regression targets for transforming an anchor to a ground truth box.
-    Both anchor and gt_box are arrays in [x1, y1, x2, y2] format.
-    Returns:
-        [dx, dy, dw, dh]
-    """
-    anchor_w = anchor[2] - anchor[0]
-    anchor_h = anchor[3] - anchor[1]
-    anchor_ctr_x = anchor[0] + 0.5 * anchor_w
-    anchor_ctr_y = anchor[1] + 0.5 * anchor_h
+def assign_anchors_to_gt_torch(anchors, gt_boxes, pos_iou_threshold=0.5, neg_iou_threshold=0.3):
+    iou_matrix = compute_iou_tensor(anchors, gt_boxes)  # (N,M)
+    max_iou, argmax_iou = torch.max(iou_matrix, dim=1)
+    labels = torch.full((anchors.shape[0],), -1, dtype=torch.int64, device=anchors.device)
+    labels[max_iou < neg_iou_threshold] = 0
+    labels[max_iou >= pos_iou_threshold] = 1
+    assigned_gt = gt_boxes[argmax_iou]
+    return labels, assigned_gt
 
-    gt_w = gt_box[2] - gt_box[0]
-    gt_h = gt_box[3] - gt_box[1]
-    gt_ctr_x = gt_box[0] + 0.5 * gt_w
-    gt_ctr_y = gt_box[1] + 0.5 * gt_h
+
+def vectorized_bbox_transform(anchors, gt_boxes):
+    anchor_w = anchors[:, 2] - anchors[:, 0]
+    anchor_h = anchors[:, 3] - anchors[:, 1]
+    anchor_ctr_x = anchors[:, 0] + 0.5 * anchor_w
+    anchor_ctr_y = anchors[:, 1] + 0.5 * anchor_h
+
+    gt_w = gt_boxes[:, 2] - gt_boxes[:, 0]
+    gt_h = gt_boxes[:, 3] - gt_boxes[:, 1]
+    gt_ctr_x = gt_boxes[:, 0] + 0.5 * gt_w
+    gt_ctr_y = gt_boxes[:, 1] + 0.5 * gt_h
 
     dx = (gt_ctr_x - anchor_ctr_x) / anchor_w
     dy = (gt_ctr_y - anchor_ctr_y) / anchor_h
-    dw = math.log(gt_w / anchor_w + 1e-6)
-    dh = math.log(gt_h / anchor_h + 1e-6)
-    return np.array([dx, dy, dw, dh], dtype=np.float32)
+    dw = torch.log(gt_w / anchor_w + 1e-6)
+    dh = torch.log(gt_h / anchor_h + 1e-6)
+    targets = torch.stack((dx, dy, dw, dh), dim=1)
+    return targets
 
 
 def decode_boxes(anchors, offsets):
-    """
-    Decode predicted offsets back into box coordinates.
-    Args:
-        anchors: Tensor of shape (N,4)
-        offsets: Tensor of shape (N,4) predicted offsets [dx, dy, dw, dh]
-    Returns:
-        boxes: Tensor of shape (N,4) in [x1, y1, x2, y2] format.
-    """
     ax = anchors[:, 0]
     ay = anchors[:, 1]
     ax2 = anchors[:, 2]
@@ -171,49 +134,191 @@ def decode_boxes(anchors, offsets):
     return boxes
 
 
-# ============================
-# Dataset: ShanghaiTechDataset
-# ============================
+def denormalize_image(tensor):
+    mean = np.array([0.485, 0.456, 0.406]).reshape(3, 1, 1)
+    std = np.array([0.229, 0.224, 0.225]).reshape(3, 1, 1)
+    tensor = tensor.cpu().numpy()
+    tensor = tensor * std + mean
+    tensor = np.clip(tensor, 0, 1)
+    img = np.transpose(tensor, (1, 2, 0))
+    img = (img * 255).astype(np.uint8)
+    return img
 
+
+# ============================
+# Vectorized Pseudo GT Update (Revised per Paper)
+# ============================
+def update_pseudo_gt_torch(pseudo_gt_np, anchors_np, pred_scores, pred_offsets, iou_threshold=0.7):
+    """
+    For each initialized pseudo GT box (g0), among all anchors with IoU > iou_threshold,
+    select the candidate with the highest score whose predicted box’s minimum side (width or height)
+    is smaller than d0 (the original g0 side length). If none, keep g0.
+    Inputs:
+      pseudo_gt_np: numpy array (M,4)
+      anchors_np: either numpy array or tensor (N,4)
+      pred_scores: tensor (N,)
+      pred_offsets: tensor (N,4)
+    Returns:
+      updated pseudo GT as a numpy array (M,4)
+    """
+    device = pred_scores.device
+    if isinstance(pseudo_gt_np, np.ndarray):
+        pseudo_gt = torch.from_numpy(pseudo_gt_np).to(device).float()
+    else:
+        pseudo_gt = pseudo_gt_np.to(device).float()
+    if isinstance(anchors_np, np.ndarray):
+        anchors = torch.from_numpy(anchors_np).to(device).float()
+    else:
+        anchors = anchors_np.to(device).float()
+
+    M = pseudo_gt.shape[0]
+    updated_boxes = []
+    for i in range(M):
+        g0 = pseudo_gt[i]  # (4,)
+        d0 = g0[2] - g0[0]  # side length (square)
+        # Compute IoU between g0 and all anchors
+        g0_exp = g0.unsqueeze(0)  # (1,4)
+        iou = compute_iou_tensor(anchors, g0_exp).squeeze(1)  # (N,)
+        cand_idx = (iou > iou_threshold).nonzero(as_tuple=False).squeeze(1)
+        if cand_idx.numel() == 0:
+            updated_boxes.append(g0)
+            continue
+        cand_anchors = anchors[cand_idx]
+        cand_scores = pred_scores[cand_idx]
+        cand_offsets = pred_offsets[cand_idx]
+        cand_boxes = decode_boxes(cand_anchors, cand_offsets)
+        widths = cand_boxes[:, 2] - cand_boxes[:, 0]
+        heights = cand_boxes[:, 3] - cand_boxes[:, 1]
+        cand_min_side = torch.min(widths, heights)
+        valid_mask = cand_min_side < d0
+        if valid_mask.sum() == 0:
+            updated_boxes.append(g0)
+        else:
+            valid_indices = cand_idx[valid_mask]
+            valid_scores = pred_scores[valid_indices]
+            best_score, best_idx_in_valid = torch.max(valid_scores, dim=0)
+            best_candidate_idx = valid_indices[best_idx_in_valid]
+            best_anchor = anchors[best_candidate_idx]
+            best_offset = pred_offsets[best_candidate_idx]
+            best_box = decode_boxes(best_anchor.unsqueeze(0), best_offset.unsqueeze(0)).squeeze(0)
+            updated_boxes.append(best_box)
+    updated_boxes = torch.stack(updated_boxes, dim=0)
+    return updated_boxes.cpu().numpy()
+
+
+# ============================
+# Visualization Functions
+# ============================
+def visualize_training_samples(dataset, num_low=2, num_high=2):
+    difficulties = np.array(dataset.difficulties)
+    sorted_indices = np.argsort(difficulties)
+    low_indices = sorted_indices[:num_low]
+    high_indices = sorted_indices[-num_high:]
+    indices = np.concatenate([low_indices, high_indices])
+    plt.figure(figsize=(15, 4 * len(indices)))
+    for i, idx in enumerate(indices):
+        sample = dataset.samples[idx]
+        img = denormalize_image(sample['image'])
+        ax = plt.subplot(len(indices), 1, i + 1)
+        ax.imshow(img)
+        pts = np.array(sample['points'])
+        if pts.size > 0:
+            ax.scatter(pts[:, 0], pts[:, 1], c='r', s=20)
+        ax.set_title(f"Difficulty: {sample['difficulty']:.3f}")
+        ax.axis('off')
+    plt.tight_layout()
+    plt.show()
+
+
+def visualize_evaluation_samples(model, test_dataset, anchors_np, device, num_samples=5, score_thresh=0.8):
+    model.eval()
+    indices = random.sample(range(len(test_dataset)), num_samples)
+    plt.figure(figsize=(12, 5 * num_samples))
+    for i, idx in enumerate(indices):
+        sample = test_dataset.samples[idx]
+        img_tensor = sample['image'].unsqueeze(0).to(device)
+        img_disp = denormalize_image(sample['image'])
+        gt_points = sample['points']
+        with torch.no_grad():
+            pred = model(img_tensor)[0]
+        scores = pred[:, 0]
+        offsets = pred[:, 1:]
+        anchors_tensor = torch.from_numpy(anchors_np).float().to(device)
+        boxes = decode_boxes(anchors_tensor, offsets)
+        probs = torch.sigmoid(scores)
+        keep = (probs > score_thresh)
+        selected_boxes = boxes[keep].cpu().numpy()
+        centers = []
+        for b in selected_boxes:
+            cx = (b[0] + b[2]) / 2.0
+            cy = (b[1] + b[3]) / 2.0
+            centers.append((cx, cy))
+
+        ax1 = plt.subplot(num_samples, 2, 2 * i + 1)
+        ax1.imshow(img_disp)
+        pts = np.array(gt_points)
+        if pts.size > 0:
+            ax1.scatter(pts[:, 0], pts[:, 1], c='r', s=20)
+        ax1.set_title("Ground Truth")
+        ax1.axis('off')
+
+        ax2 = plt.subplot(num_samples, 2, 2 * i + 2)
+        ax2.imshow(img_disp)
+        for b in selected_boxes:
+            rect = patches.Rectangle((b[0], b[1]), b[2] - b[0], b[3] - b[1],
+                                     linewidth=1.5, edgecolor='g', facecolor='none')
+            ax2.add_patch(rect)
+        if len(centers) > 0:
+            centers = np.array(centers)
+            ax2.scatter(centers[:, 0], centers[:, 1], c='b', s=20)
+        ax2.set_title("Predictions (Boxes & Centers)")
+        ax2.axis('off')
+    plt.tight_layout()
+    plt.show()
+
+
+def visualize_pseudo_gt_update(sample, pseudo_before, pseudo_after):
+    img = denormalize_image(sample['image'])
+    plt.figure(figsize=(20, 10))
+    ax1 = plt.subplot(1, 2, 1)
+    ax1.imshow(img)
+    for bbox in pseudo_before:
+        rect = patches.Rectangle((bbox[0], bbox[1]), bbox[2] - bbox[0], bbox[3] - bbox[1],
+                                 linewidth=1, edgecolor='r', facecolor='none')
+        ax1.add_patch(rect)
+    ax1.set_title("Before Pseudo GT Update")
+    ax1.axis('off')
+
+    ax2 = plt.subplot(1, 2, 2)
+    ax2.imshow(img)
+    for bbox in pseudo_after:
+        rect = patches.Rectangle((bbox[0], bbox[1]), bbox[2] - bbox[0], bbox[3] - bbox[1],
+                                 linewidth=1, edgecolor='g', facecolor='none')
+        ax2.add_patch(rect)
+    ax2.set_title("After Pseudo GT Update")
+    ax2.axis('off')
+    plt.tight_layout()
+    plt.show()
+
+
+# ============================
+# Dataset: Preloaded and Cached ShanghaiTechDataset
+# ============================
 class ShanghaiTechDataset(Dataset):
-    """
-    Dataset class for ShanghaiTech PartA or PartB.
-    Assumes the following folder structure:
-      datasets/
-          partA/
-              train_data/
-                  images/
-                  ground_truth/
-              test_data/
-                  images/
-                  ground_truth/
-          partB/
-              train_data/
-                  images/
-                  ground_truth/
-              test_data/
-                  images/
-                  ground_truth/
-    The .mat files contain a dict with the form:
-      {'image_info': {'location': [[x1, y1], [x2, y2], ...], 'number': count}}
-    This class precomputes:
-      - The scaled point annotations (based on the target image_size)
-      - The pseudo ground truth boxes (using nearest neighbor distances)
-      - A difficulty score per image (for curriculum learning)
-      - The ground truth count
-    """
-
-    def __init__(self, root, part='partA', split='train', image_size=(512, 512), transform=None):
+    def __init__(self, root, part='partA', split='train', image_size=(512, 512), transform=None, cache_dir="cache"):
         self.root = root
         self.part = part
-        self.split = split  # 'train' or 'test'
+        self.split = split
         self.image_size = image_size
+        self.cache_dir = cache_dir
+        os.makedirs(cache_dir, exist_ok=True)
+
         self.data_dir = os.path.join(root, part, f"{'train_data' if split == 'train' else 'test_data'}")
         self.images_dir = os.path.join(self.data_dir, "images")
         self.gt_dir = os.path.join(self.data_dir, "ground_truth")
 
         self.image_files = sorted([f for f in os.listdir(self.images_dir) if f.lower().endswith('.jpg')])
-        self.gt_files = [os.path.join(self.gt_dir, 'GT_'+os.path.splitext(f)[0] + '.mat') for f in self.image_files]
+        self.gt_files = [os.path.join(self.gt_dir,"GT_" + os.path.splitext(f)[0] + '.mat') for f in self.image_files]
 
         if transform is None:
             self.transform = transforms.Compose([
@@ -225,83 +330,82 @@ class ShanghaiTechDataset(Dataset):
         else:
             self.transform = transform
 
-        # Precompute per-sample attributes.
-        self.scaled_points_list = []
-        self.pseudo_gts = []
-        self.difficulties = []
-        self.gt_counts = []
+        cache_path = os.path.join(cache_dir, f"preprocessed_{part}_{split}_{image_size[0]}.pkl")
+        if os.path.exists(cache_path):
+            print(f"Loading preprocessed data from {cache_path} ...")
+            with open(cache_path, "rb") as f:
+                cache = pickle.load(f)
+            self.samples = cache["samples"]
+            self.difficulties = cache["difficulties"]
+        else:
+            print("Preprocessing data...")
+            self.samples = []
+            self.difficulties = []
+            for idx in range(len(self.image_files)):
+                img_path = os.path.join(self.images_dir, self.image_files[idx])
+                image = Image.open(img_path).convert("RGB")
+                orig_w, orig_h = image.size
+                new_w, new_h = self.image_size
+                scale_x = new_w / orig_w
+                scale_y = new_h / orig_h
+                image_tensor = self.transform(image)
 
-        for idx in range(len(self.image_files)):
-            gt_path = self.gt_files[idx]
-            gt_data = loadmat(gt_path)
-            points = gt_data['image_info']['location']
-            points = [(float(p[0]), float(p[1])) for p in points]
-            img_path = os.path.join(self.images_dir, self.image_files[idx])
-            with Image.open(img_path) as img:
-                orig_w, orig_h = img.size
-            new_w, new_h = self.image_size
-            scale_x = new_w / orig_w
-            scale_y = new_h / orig_h
-            scaled_points = [(p[0] * scale_x, p[1] * scale_y) for p in points]
-            self.scaled_points_list.append(scaled_points)
+                gt_path = self.gt_files[idx]
+                gt_data = loadmat(gt_path)
+                points = gt_data['image_info']['location']
+                points = [(float(p[0]), float(p[1])) for p in points]
+                scaled_points = [(p[0] * scale_x, p[1] * scale_y) for p in points]
+                pseudo_gt = generate_pseudo_gt_from_points(scaled_points)
 
-            pseudo_gt = generate_pseudo_gt_from_points(scaled_points)
-            self.pseudo_gts.append(pseudo_gt)
+                dists = []
+                for i, pt in enumerate(scaled_points):
+                    if len(scaled_points) > 1:
+                        d = min([compute_euclidean_distance(pt, q) for j, q in enumerate(scaled_points) if i != j])
+                    else:
+                        d = 32.0
+                    dists.append(d)
+                dists = np.array(dists)
+                mu = np.mean(dists)
+                sigma = np.std(dists) if np.std(dists) > 0 else 1.0
+                scores = np.exp(-((dists - mu) ** 2) / (2 * sigma ** 2))
+                difficulty = 1 - np.mean(scores)
 
-            dists = []
-            for i, pt in enumerate(scaled_points):
-                if len(scaled_points) > 1:
-                    d = min([compute_euclidean_distance(pt, q) for j, q in enumerate(scaled_points) if i != j])
-                else:
-                    d = 32.0
-                dists.append(d)
-            dists = np.array(dists)
-            mu = np.mean(dists)
-            sigma = np.std(dists) if np.std(dists) > 0 else 1.0
-            scores = np.exp(-((dists - mu) ** 2) / (2 * sigma ** 2))
-            difficulty = 1 - np.mean(scores)
-            self.difficulties.append(difficulty)
-
-            gt_count = int(gt_data['image_info']['number'])
-            self.gt_counts.append(gt_count)
+                gt_count = int(gt_data['image_info']['number'])
+                sample = {
+                    'image': image_tensor,
+                    'points': scaled_points,
+                    'pseudo_gt': pseudo_gt,
+                    'gt_count': gt_count,
+                    'difficulty': difficulty
+                }
+                self.samples.append(sample)
+                self.difficulties.append(difficulty)
+            print("Saving preprocessed data to cache...")
+            with open(cache_path, "wb") as f:
+                pickle.dump({"samples": self.samples, "difficulties": self.difficulties}, f)
+            print("Preprocessing done.")
 
     def __len__(self):
-        return len(self.image_files)
+        return len(self.samples)
 
     def __getitem__(self, idx):
-        img_path = os.path.join(self.images_dir, self.image_files[idx])
-        image = Image.open(img_path).convert("RGB")
-        image = self.transform(image)
-        sample = {
-            'image': image,  # Tensor (3, H, W)
-            'points': self.scaled_points_list[idx],  # List of (x,y)
-            'pseudo_gt': self.pseudo_gts[idx],  # numpy array (N,4)
-            'gt_count': self.gt_counts[idx],  # integer
-            'difficulty': self.difficulties[idx]  # float
-        }
-        return sample
+        return self.samples[idx]
 
 
 # ============================
 # Model: PSDDN
 # ============================
-
 class PSDDN(nn.Module):
     def __init__(self, num_anchors=9):
-        """
-        PSDDN using a ResNet-101 backbone.
-        Detection heads are attached to layer3 and layer4.
-        The head outputs (score, dx, dy, dw, dh) per anchor.
-        """
         super(PSDDN, self).__init__()
         resnet = models.resnet101(pretrained=True)
         self.layer0 = nn.Sequential(
             resnet.conv1, resnet.bn1, resnet.relu, resnet.maxpool
         )
-        self.layer1 = resnet.layer1  # stride 4
-        self.layer2 = resnet.layer2  # stride 8
-        self.layer3 = resnet.layer3  # stride 16
-        self.layer4 = resnet.layer4  # stride 32
+        self.layer1 = resnet.layer1
+        self.layer2 = resnet.layer2
+        self.layer3 = resnet.layer3
+        self.layer4 = resnet.layer4
 
         in_channels_layer3 = 1024
         in_channels_layer4 = 2048
@@ -328,46 +432,40 @@ class PSDDN(nn.Module):
         final_pred = pred3 + pred4_up
 
         B, C, Hf, Wf = final_pred.shape
+        self.feature_map_shape = (Hf, Wf)  # Save feature map size for anchor generation.
         T = C // 5
         final_pred = final_pred.view(B, T, 5, Hf, Wf).permute(0, 3, 4, 1, 2).contiguous()
         final_pred = final_pred.view(B, -1, 5)
-        return final_pred  # (B, N, 5)
+        return final_pred
 
 
 # ============================
-# Loss Functions
+# Loss Functions (Vectorized GPU)
 # ============================
-
-def assign_anchors_to_gt(anchors, gt_boxes, pos_iou_threshold=0.5, neg_iou_threshold=0.3):
-    N = anchors.shape[0]
-    M = gt_boxes.shape[0]
-    labels = -np.ones((N,), dtype=np.int32)
-    assigned_gt = np.zeros((N, 4), dtype=np.float32)
-    for i in range(N):
-        max_iou = 0
-        best_gt = None
-        for j in range(M):
-            iou = compute_iou(anchors[i], gt_boxes[j])
-            if iou > max_iou:
-                max_iou = iou
-                best_gt = gt_boxes[j]
-        if max_iou >= pos_iou_threshold:
-            labels[i] = 1
-            assigned_gt[i] = best_gt
-        elif max_iou < neg_iou_threshold:
-            labels[i] = 0
-        else:
-            labels[i] = -1
-    return labels, assigned_gt
-
-
-def compute_regression_targets(anchors, assigned_gt, labels):
-    N = anchors.shape[0]
-    target_offsets = np.zeros((N, 4), dtype=np.float32)
-    for i in range(N):
-        if labels[i] == 1:
-            target_offsets[i] = bbox_transform(anchors[i], assigned_gt[i])
-    return target_offsets
+def compute_total_loss(pred, anchors_np, gt_boxes_np):
+    anchors = torch.from_numpy(anchors_np).to(pred.device).float()  # (N,4)
+    gt_boxes = torch.from_numpy(gt_boxes_np).to(pred.device).float()  # (M,4)
+    labels, assigned_gt = assign_anchors_to_gt_torch(anchors, gt_boxes, pos_iou_threshold=0.5, neg_iou_threshold=0.3)
+    target_offsets = vectorized_bbox_transform(anchors, assigned_gt)
+    scores = pred[:, 0]
+    offsets = pred[:, 1:]
+    valid_mask = labels != -1
+    if valid_mask.sum() > 0:
+        cls_loss = F.binary_cross_entropy_with_logits(scores[valid_mask].float(), labels[valid_mask].float())
+    else:
+        cls_loss = torch.tensor(0.0, device=pred.device)
+    pos_mask = labels == 1
+    if pos_mask.sum() > 0:
+        pred_offsets_pos = offsets[pos_mask]
+        target_offsets_pos = target_offsets[pos_mask]
+        anchors_pos = anchors[pos_mask]
+        pred_boxes = decode_boxes(anchors_pos, pred_offsets_pos)
+        reg_loss = F.smooth_l1_loss(pred_offsets_pos, target_offsets_pos, reduction='mean')
+        lc_loss = locally_constrained_regression_loss(pred_offsets_pos, target_offsets_pos, pred_boxes)
+    else:
+        reg_loss = torch.tensor(0.0, device=pred.device)
+        lc_loss = torch.tensor(0.0, device=pred.device)
+    return cls_loss + reg_loss + lc_loss
 
 
 def locally_constrained_regression_loss(pred_offsets, target_offsets, pred_boxes, local_band_size=3):
@@ -400,95 +498,129 @@ def locally_constrained_regression_loss(pred_offsets, target_offsets, pred_boxes
     return loss_center + loss_wh
 
 
-def compute_total_loss(pred, anchors, gt_boxes):
-    labels_np, assigned_gt_np = assign_anchors_to_gt(anchors, gt_boxes, pos_iou_threshold=0.5, neg_iou_threshold=0.3)
-    labels = torch.from_numpy(labels_np).to(pred.device).long()
-    target_offsets_np = compute_regression_targets(anchors, assigned_gt_np, labels_np)
-    target_offsets = torch.from_numpy(target_offsets_np).to(pred.device).float()
+def assign_anchors_to_gt_torch(anchors, gt_boxes, pos_iou_threshold=0.5, neg_iou_threshold=0.3):
+    iou_matrix = compute_iou_tensor(anchors, gt_boxes)  # (N,M)
+    max_iou, argmax_iou = torch.max(iou_matrix, dim=1)
+    labels = torch.full((anchors.shape[0],), -1, dtype=torch.int64, device=anchors.device)
+    labels[max_iou < neg_iou_threshold] = 0
+    labels[max_iou >= pos_iou_threshold] = 1
+    assigned_gt = gt_boxes[argmax_iou]
+    return labels, assigned_gt
 
-    scores = pred[:, 0]
-    offsets = pred[:, 1:]
 
-    valid_mask = labels != -1
-    if valid_mask.sum() > 0:
-        cls_loss = F.binary_cross_entropy_with_logits(scores[valid_mask].float(), labels[valid_mask].float())
+def vectorized_bbox_transform(anchors, gt_boxes):
+    anchor_w = anchors[:, 2] - anchors[:, 0]
+    anchor_h = anchors[:, 3] - anchors[:, 1]
+    anchor_ctr_x = anchors[:, 0] + 0.5 * anchor_w
+    anchor_ctr_y = anchors[:, 1] + 0.5 * anchor_h
+
+    gt_w = gt_boxes[:, 2] - gt_boxes[:, 0]
+    gt_h = gt_boxes[:, 3] - gt_boxes[:, 1]
+    gt_ctr_x = gt_boxes[:, 0] + 0.5 * gt_w
+    gt_ctr_y = gt_boxes[:, 1] + 0.5 * gt_h
+
+    dx = (gt_ctr_x - anchor_ctr_x) / anchor_w
+    dy = (gt_ctr_y - anchor_ctr_y) / anchor_h
+    dw = torch.log(gt_w / anchor_w + 1e-6)
+    dh = torch.log(gt_h / anchor_h + 1e-6)
+    targets = torch.stack((dx, dy, dw, dh), dim=1)
+    return targets
+
+
+def compute_iou_tensor(anchors, gt_boxes):
+    N = anchors.shape[0]
+    M = gt_boxes.shape[0]
+    x1 = torch.max(anchors[:, None, 0], gt_boxes[None, :, 0])
+    y1 = torch.max(anchors[:, None, 1], gt_boxes[None, :, 1])
+    x2 = torch.min(anchors[:, None, 2], gt_boxes[None, :, 2])
+    y2 = torch.min(anchors[:, None, 3], gt_boxes[None, :, 3])
+    inter = torch.clamp(x2 - x1, min=0) * torch.clamp(y2 - y1, min=0)
+    area_anchor = (anchors[:, 2] - anchors[:, 0]) * (anchors[:, 3] - anchors[:, 1])
+    area_gt = (gt_boxes[:, 2] - gt_boxes[:, 0]) * (gt_boxes[:, 3] - gt_boxes[:, 1])
+    union = area_anchor[:, None] + area_gt[None, :] - inter + 1e-6
+    iou = inter / union
+    return iou
+
+
+# ============================
+# Vectorized Pseudo GT Update (Revised per Paper)
+# ============================
+def update_pseudo_gt_torch(pseudo_gt_np, anchors_np, pred_scores, pred_offsets, iou_threshold=0.7):
+    """
+    For each pseudo GT box g0, among all anchors with IoU > iou_threshold,
+    select the candidate with the highest score whose predicted box's
+    minimum side is smaller than the original g0 side length.
+    """
+    device = pred_scores.device
+    if isinstance(pseudo_gt_np, np.ndarray):
+        pseudo_gt = torch.from_numpy(pseudo_gt_np).to(device).float()
     else:
-        cls_loss = torch.tensor(0.0, device=pred.device)
-
-    pos_mask = labels == 1
-    if pos_mask.sum() > 0:
-        pred_offsets_pos = offsets[pos_mask]
-        target_offsets_pos = target_offsets[pos_mask]
-        anchors_pos = torch.from_numpy(anchors).to(pred.device)[pos_mask]
-        pred_boxes = decode_boxes(anchors_pos, pred_offsets_pos)
-        reg_loss = F.smooth_l1_loss(pred_offsets_pos, target_offsets_pos, reduction='mean')
-        lc_loss = locally_constrained_regression_loss(pred_offsets_pos, target_offsets_pos, pred_boxes)
+        pseudo_gt = pseudo_gt_np.to(device).float()
+    if isinstance(anchors_np, np.ndarray):
+        anchors = torch.from_numpy(anchors_np).to(device).float()
     else:
-        reg_loss = torch.tensor(0.0, device=pred.device)
-        lc_loss = torch.tensor(0.0, device=pred.device)
-
-    return cls_loss + reg_loss + lc_loss
-
-
-# ============================
-# Pseudo Ground Truth Updating
-# ============================
-
-def update_pseudo_gt(pseudo_gt, anchors, pred_scores, pred_offsets, iou_threshold=0.5):
-    new_pseudo_gt = pseudo_gt.copy()
-    for i, gt_box in enumerate(pseudo_gt):
-        best_score = -1
-        best_box = None
-        for j, anchor in enumerate(anchors):
-            iou = compute_iou(anchor, gt_box)
-            if iou > iou_threshold and pred_scores[j] > best_score:
-                ax, ay, ax2, ay2 = anchor
-                aw = ax2 - ax
-                ah = ay2 - ay
-                anchor_ctr_x = ax + 0.5 * aw
-                anchor_ctr_y = ay + 0.5 * ah
-                dx, dy, dw, dh = pred_offsets[j]
-                pred_ctr_x = dx * aw + anchor_ctr_x
-                pred_ctr_y = dy * ah + anchor_ctr_y
-                pred_w = aw * math.exp(dw)
-                pred_h = ah * math.exp(dh)
-                pred_box = [pred_ctr_x - 0.5 * pred_w,
-                            pred_ctr_y - 0.5 * pred_h,
-                            pred_ctr_x + 0.5 * pred_w,
-                            pred_ctr_y + 0.5 * pred_h]
-                best_score = pred_scores[j]
-                best_box = pred_box
-        if best_box is not None:
-            new_pseudo_gt[i] = best_box
-    return new_pseudo_gt
+        anchors = anchors_np.to(device).float()
+    M = pseudo_gt.shape[0]
+    updated_boxes = []
+    for i in range(M):
+        g0 = pseudo_gt[i]  # (4,)
+        d0 = g0[2] - g0[0]
+        g0_exp = g0.unsqueeze(0)  # (1,4)
+        iou = compute_iou_tensor(anchors, g0_exp).squeeze(1)  # (N,)
+        cand_idx = (iou > iou_threshold).nonzero(as_tuple=False).squeeze(1)
+        if cand_idx.numel() == 0:
+            updated_boxes.append(g0)
+            continue
+        cand_anchors = anchors[cand_idx]
+        cand_scores = pred_scores[cand_idx]
+        cand_offsets = pred_offsets[cand_idx]
+        cand_boxes = decode_boxes(cand_anchors, cand_offsets)
+        widths = cand_boxes[:, 2] - cand_boxes[:, 0]
+        heights = cand_boxes[:, 3] - cand_boxes[:, 1]
+        cand_min_side = torch.min(widths, heights)
+        valid_mask = cand_min_side < d0
+        if valid_mask.sum() == 0:
+            updated_boxes.append(g0)
+        else:
+            valid_indices = cand_idx[valid_mask]
+            valid_scores = pred_scores[valid_indices]
+            best_score, best_idx_in_valid = torch.max(valid_scores, dim=0)
+            best_candidate_idx = valid_indices[best_idx_in_valid]
+            best_anchor = anchors[best_candidate_idx]
+            best_offset = pred_offsets[best_candidate_idx]
+            best_box = decode_boxes(best_anchor.unsqueeze(0), best_offset.unsqueeze(0)).squeeze(0)
+            updated_boxes.append(best_box)
+    updated_boxes = torch.stack(updated_boxes, dim=0)
+    return updated_boxes.cpu().numpy()
 
 
 # ============================
-# Curriculum Learning Sampler
+# Manual Batching Function
 # ============================
-
-def curriculum_sampler(dataset, current_epoch, total_epochs):
-    difficulties = np.array(dataset.difficulties)
-    sorted_indices = np.argsort(difficulties)
-    frac = min(1.0, (current_epoch / total_epochs) * 2)
-    num_samples = int(frac * len(dataset))
-    selected_indices = sorted_indices[:num_samples]
-    return selected_indices.tolist()
+def get_batches(samples, batch_size):
+    random.shuffle(samples)
+    for i in range(0, len(samples), batch_size):
+        yield samples[i:i + batch_size]
 
 
 # ============================
-# Training and Evaluation
+# Training and Evaluation (Manual Batching, Preloaded Data)
 # ============================
-
 def train_model(args):
     train_dataset = ShanghaiTechDataset(
         root=args.data_root,
         part=args.part,
         split='train',
-        image_size=(args.img_size, args.img_size)
+        image_size=(args.img_size, args.img_size),
+        cache_dir=args.cache_dir
     )
     total_epochs = args.epochs
 
+    if args.visualize_train:
+        print("Visualizing training samples with extreme difficulties...")
+        visualize_training_samples(train_dataset, num_low=2, num_high=2)
+
+    # Instead of using DataLoader, we use manual batching.
     feature_map_size = (args.img_size // 16, args.img_size // 16)
     stride = 16
     anchor_scales = [32, 64, 128]
@@ -505,48 +637,51 @@ def train_model(args):
         print(f"Epoch {epoch}/{total_epochs}")
         selected_indices = curriculum_sampler(train_dataset, epoch, total_epochs)
         print(f"Using {len(selected_indices)}/{len(train_dataset)} samples this epoch (curriculum fraction)")
-        subset = Subset(train_dataset, selected_indices)
-        dataloader = DataLoader(subset, batch_size=args.batch_size, shuffle=True,
-                                num_workers=4, collate_fn=custom_collate)
+        subset_samples = [train_dataset.samples[i] for i in selected_indices]
+        epoch_batches = list(get_batches(subset_samples, args.batch_size))
 
         running_loss = 0.0
-        for batch in dataloader:
-            images = batch['image'].to(device)
-            B = images.size(0)
-            pseudo_gt_list = batch['pseudo_gt']
-
+        for batch in epoch_batches:
+            batch_images = torch.stack([s['image'] for s in batch], dim=0).to(device)
+            B = batch_images.size(0)
             optimizer.zero_grad()
-            preds = model(images)
+            preds = model(batch_images)
             batch_loss = 0.0
             for b in range(B):
                 pred = preds[b]
-                gt_boxes = pseudo_gt_list[b]
+                gt_boxes = batch[b]['pseudo_gt']
                 loss = compute_total_loss(pred, anchors_np, gt_boxes)
                 batch_loss += loss
             batch_loss = batch_loss / B
             batch_loss.backward()
             optimizer.step()
-
             running_loss += batch_loss.item()
             global_step += 1
             if global_step % 10 == 0:
                 print(f"Step {global_step}: Loss = {batch_loss.item():.4f}")
-        epoch_loss = running_loss / len(dataloader)
+        epoch_loss = running_loss / len(epoch_batches)
         print(f"Epoch {epoch} average loss: {epoch_loss:.4f}")
 
-        # Pseudo ground truth update:
+        # Save a copy of pseudo_gt before update for one sample.
+        vis_idx = selected_indices[0]
+        sample_before = train_dataset.samples[vis_idx]['pseudo_gt'].copy()
         model.eval()
-        with torch.no_grad():
-            for idx in selected_indices:
-                sample = train_dataset[idx]
-                img_path = os.path.join(train_dataset.images_dir, train_dataset.image_files[idx])
-                image = Image.open(img_path).convert("RGB")
-                image = train_dataset.transform(image).unsqueeze(0).to(device)
-                pred = model(image)[0].cpu().numpy()
-                pred_scores = pred[:, 0]
-                pred_offsets = pred[:, 1:]
-                new_pseudo_gt = update_pseudo_gt(sample['pseudo_gt'], anchors_np, pred_scores, pred_offsets)
-                train_dataset.pseudo_gts[idx] = new_pseudo_gt
+        for idx in selected_indices:
+            sample = train_dataset.samples[idx]
+            img_path = os.path.join(train_dataset.images_dir, train_dataset.image_files[idx])
+            image = Image.open(img_path).convert("RGB")
+            image = train_dataset.transform(image).unsqueeze(0).to(device)
+            with torch.no_grad():
+                pred = model(image)[0].cpu()
+            pred_scores = torch.sigmoid(pred[:, 0])
+            pred_offsets = pred[:, 1:]
+            new_pseudo_gt = update_pseudo_gt_torch(sample['pseudo_gt'], anchors_np, pred_scores, pred_offsets,
+                                                   iou_threshold=0.7)
+            train_dataset.samples[idx]['pseudo_gt'] = new_pseudo_gt
+        if args.visualize_train:
+            sample_after = train_dataset.samples[vis_idx]['pseudo_gt']
+            print("Visualizing pseudo GT update for one sample:")
+            visualize_pseudo_gt_update(train_dataset.samples[vis_idx], sample_before, sample_after)
         model.train()
 
         os.makedirs(args.save_dir, exist_ok=True)
@@ -562,58 +697,78 @@ def evaluate_model(args):
         root=args.data_root,
         part=args.part,
         split='test',
-        image_size=(args.img_size, args.img_size)
+        image_size=(args.img_size, args.img_size),
+        cache_dir=args.cache_dir
     )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = PSDDN(num_anchors=len([32, 64, 128]) * len([0.5, 1.0, 2.0])).to(device)
     model.load_state_dict(torch.load(args.model_path, map_location=device))
     model.eval()
 
-    feature_map_size = (args.img_size // 16, args.img_size // 16)
+    # Generate anchors using feature map size from a forward pass
+    with torch.no_grad():
+        sample_img = test_dataset.samples[0]['image'].unsqueeze(0).to(device)
+        _ = model(sample_img)  # this sets model.feature_map_shape
+    Hf, Wf = model.feature_map_shape
     stride = 16
     anchor_scales = [32, 64, 128]
     anchor_ratios = [0.5, 1.0, 2.0]
-    anchors_np = generate_anchors(feature_map_size, stride, anchor_scales, anchor_ratios)
+    anchors_np = generate_anchors((Hf, Wf), stride, anchor_scales, anchor_ratios)
 
     total_error = 0.0
     num_images = len(test_dataset)
-    dataloader = DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=4, collate_fn=custom_collate)
-    for batch in dataloader:
-        image = batch['image'].to(device)
-        gt_count = batch['gt_count'][0]
+    for sample in test_dataset.samples:
+        image = sample['image'].unsqueeze(0).to(device)
+        gt_count = sample['gt_count']
         with torch.no_grad():
-            preds = model(image)[0].cpu()
+            preds = model(image)[0].to(device)
         scores = preds[:, 0]
         offsets = preds[:, 1:]
-        anchors_tensor = torch.from_numpy(anchors_np).float()
+        anchors_tensor = torch.from_numpy(anchors_np).float().to(device)
         boxes = decode_boxes(anchors_tensor, offsets)
         probs = torch.sigmoid(scores)
         score_thresh = 0.8
         keep = (probs > score_thresh)
         pred_count = keep.sum().item()
-        total_error += abs(pred_count - gt_count)
-    mae = total_error / num_images
-    print(f"Evaluation MAE: {mae:.2f}")
-    return mae
+        if gt_count > 0:
+            error = abs(pred_count - gt_count) / gt_count
+        else:
+            error = 0.0
+        total_error += error
+    mape = (total_error / num_images) * 100
+    print(f"Evaluation MAPE: {mape:.2f}%")
 
+    if args.visualize_eval:
+        visualize_evaluation_samples(model, test_dataset, anchors_np, device, num_samples=5, score_thresh=score_thresh)
+    return mape
 
+def curriculum_sampler(dataset, current_epoch, total_epochs):
+    difficulties = np.array(dataset.difficulties)
+    sorted_indices = np.argsort(difficulties)
+    frac = min(1.0, (current_epoch / total_epochs) * 2)
+    num_samples = int(frac * len(dataset))
+    selected_indices = sorted_indices[:num_samples]
+    return selected_indices.tolist()
 # ============================
-# Main
+# Main and Argument Parsing
 # ============================
-
 def parse_args():
-    parser = argparse.ArgumentParser(description="PSDDN for Crowd Counting on ShanghaiTech")
+    parser = argparse.ArgumentParser(description="PSDDN for Crowd Counting on ShanghaiTech (GPU Vectorized)")
     parser.add_argument("--data_root", type=str, default="datasets", help="Root folder of datasets")
     parser.add_argument("--part", type=str, choices=["partA", "partB"], default="partA", help="Dataset part (A or B)")
     parser.add_argument("--mode", type=str, choices=["train", "eval"], default="train",
                         help="Mode: train or evaluation")
     parser.add_argument("--img_size", type=int, default=512, help="Input image size (square)")
     parser.add_argument("--batch_size", type=int, default=4, help="Batch size for training")
-    parser.add_argument("--epochs", type=int, default=50, help="Number of training epochs")
+    parser.add_argument("--epochs", type=int, default=10, help="Number of training epochs")
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
     parser.add_argument("--save_dir", type=str, default="checkpoints", help="Directory to save checkpoints")
-    parser.add_argument("--model_path", type=str, default="checkpoints/psddn_epoch50.pth",
+    parser.add_argument("--model_path", type=str, default="checkpoints/psddn_epoch5.pth",
                         help="Path to trained model for evaluation")
+    parser.add_argument("--cache_dir", type=str, default="cache", help="Directory to save preprocessed dataset cache")
+    parser.add_argument("--visualize_train", action="store_true",
+                        help="Visualize training samples and pseudo GT updates")
+    parser.add_argument("--visualize_eval", action="store_true", help="Visualize evaluation samples")
     return parser.parse_args()
 
 
