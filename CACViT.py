@@ -256,9 +256,11 @@ class CACViT(nn.Module):
 def custom_collate_fn(batch):
     images = torch.stack([item[0] for item in batch])
     density_maps = torch.stack([item[1] for item in batch])
-    exemplars = torch.stack([item[2] for item in batch])  # (B, num_exemplars, C, H, W)
+    exemplars = torch.stack([item[2] for item in batch])
     scales = torch.stack([item[3] for item in batch])
-    return images, density_maps, exemplars, scales
+    gt_counts = [item[4] for item in batch]  # This returns a list of counts
+    return images, density_maps, exemplars, scales, gt_counts
+
 
 
 #############################################
@@ -325,7 +327,7 @@ if __name__ == '__main__':
     for epoch in range(start_epoch, num_epochs + 1):
         model.train()
         total_loss = 0.0
-        for batch_idx, (images, gt_density, exemplars, scales) in enumerate(train_loader):
+        for batch_idx, (images, gt_density, exemplars, scales,gt_count) in enumerate(train_loader):
             images = images.to(device)
             gt_density = gt_density.to(device)
             exemplars = exemplars.to(device)
@@ -367,50 +369,57 @@ if __name__ == '__main__':
                     os.remove(oldest_checkpoint)
                     print(f"Deleted old checkpoint: {oldest_checkpoint}")
 
-        # --- Evaluation & Visualization on 1 Test Image ---
-        model.eval()
-        with torch.no_grad():
-            sample = next(iter(test_loader))
-            test_img, test_gt_density, test_exemplars, test_scales, gt_count = sample
-            test_img = test_img.to(device)
-            test_exemplars = test_exemplars.to(device)
-            test_scales = test_scales.to(device)
-            output_density = model([test_img, test_exemplars, test_scales])  # (1, 384, 384)
-            output_density_np = output_density.squeeze(0).cpu().numpy()
-            gt_density_np = test_gt_density.squeeze(0).cpu().numpy()
+            # --- Evaluation & Visualization on 1 Test Image ---
+            model.eval()
+            with torch.no_grad():
+                sample = next(iter(test_loader))
+                test_img, test_gt_density, test_exemplars, test_scales, gt_count = sample
+                test_img = test_img.to(device)
+                test_gt_density = test_gt_density.to(device)
+                test_exemplars = test_exemplars.to(device)
+                test_scales = test_scales.to(device)
+                output_density = model([test_img, test_exemplars, test_scales])  # (1, 384, 384)
+                output_density_np = output_density.squeeze(0).cpu().numpy()
+                gt_density_np = test_gt_density.squeeze(0).cpu().numpy()
 
-            pred_count = output_density_np.sum()
+                pred_count = output_density_np.sum()
+                gt_density_resized = F.interpolate(test_gt_density.unsqueeze(1), size=(384, 384), mode='bilinear',
+                                                   align_corners=False).squeeze(1)
+                loss = criterion(gt_density_resized, output_density)
+                print(f"Eval loss: {loss}")
+                # Convert normalized image back to PIL image for display (reverse normalization)
+                inv_normalize = transforms.Normalize(
+                    mean=[-0.485 / 0.229, -0.456 / 0.224, -0.406 / 0.225],
+                    std=[1 / 0.229, 1 / 0.224, 1 / 0.225]
+                )
+                disp_img = test_img.squeeze(0).cpu()
+                disp_img = inv_normalize(disp_img)
+                disp_img = torch.clamp(disp_img, 0, 1)
+                disp_img = transforms.ToPILImage()(disp_img)
 
-            # Convert normalized image back to PIL image for display (reverse normalization)
-            inv_normalize = transforms.Normalize(
-                mean=[-0.485 / 0.229, -0.456 / 0.224, -0.406 / 0.225],
-                std=[1 / 0.229, 1 / 0.224, 1 / 0.225]
-            )
-            disp_img = test_img.squeeze(0).cpu()
-            disp_img = inv_normalize(disp_img)
-            disp_img = torch.clamp(disp_img, 0, 1)
-            disp_img = transforms.ToPILImage()(disp_img)
+                # Plotting
+                plt.figure(figsize=(18, 6))
+                plt.subplot(1, 3, 1)
+                plt.imshow(disp_img)
+                plt.title("Input Image")
+                plt.axis('off')
 
-            # Plotting
-            plt.figure(figsize=(18, 6))
-            plt.subplot(1, 3, 1)
-            plt.imshow(disp_img)
-            plt.title("Input Image")
-            plt.axis('off')
+                if isinstance(gt_count, list):
+                    gt_count = float(gt_count[0])
 
-            plt.subplot(1, 3, 2)
-            plt.imshow(gt_density_np, cmap='jet')
-            plt.title(f"GT Density Map\nCount: {gt_count:.2f}")
-            plt.axis('off')
+                plt.subplot(1, 3, 2)
+                plt.imshow(gt_density_np, cmap='jet')
+                plt.title(f"GT Density Map\nCount: {gt_count:.2f}")
+                plt.axis('off')
 
-            plt.subplot(1, 3, 3)
-            plt.imshow(output_density_np, cmap='jet')
-            plt.title(f"Predicted Density Map\nCount: {pred_count:.2f}")
-            plt.axis('off')
+                plt.subplot(1, 3, 3)
+                plt.imshow(output_density_np, cmap='jet')
+                plt.title(f"Predicted Density Map\nCount: {pred_count:.2f}")
+                plt.axis('off')
 
-            plt.suptitle(f"Epoch {epoch + 1} Evaluation", fontsize=16)
-            plt.tight_layout()
-            plt.savefig("CACVIT_VIS.png")
+                plt.suptitle(f"Epoch {epoch + 1} Evaluation", fontsize=16)
+                plt.tight_layout()
+                plt.savefig("CACVIT_VIS.png")
 
     # Save the final model
     torch.save(model.state_dict(), 'cacvit_crowd_counting.pth')

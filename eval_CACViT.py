@@ -1,221 +1,146 @@
-"""
-eval_cacvit_crowd.py
-
-This script loads the trained CACViT model and evaluates it on the test_data from the PartA dataset.
-For each test sample, it visualizes:
-    - The original image.
-    - The ground-truth density map (derived from the .mat file).
-    - The predicted density map.
-The title on each figure displays both the ground truth count and the predicted count.
-"""
-
-import os
-import math
-import torch
 import numpy as np
+import torch
+from PIL.Image import Image
+from torch.utils.data import Dataset, DataLoader
+import torchvision.transforms as transforms
 import matplotlib.pyplot as plt
-from torchvision import transforms
-from PIL import Image
-from mat4py import loadmat
-from scipy.ndimage import gaussian_filter
+from CACViT import CrowdCountingDataset, transform, exemplar_transform, CACViT, custom_collate_fn
+from ultralytics import YOLO
 
-# --------------------------
-# If available, import your model & dataset definitions.
-# Otherwise, we include minimal definitions here.
-# --------------------------
-try:
-    from CACViT import cacvit_single, CrowdCountingDataset
-except ImportError:
-    # Minimal dataset definition for evaluation
-    class CrowdCountingDataset(torch.utils.data.Dataset):
-        def __init__(self, root, mode='test', img_size=384, transform=None):
-            """
-            Args:
-                root: path to datasets/partA
-                mode: 'train' or 'test'
-                img_size: image resolution (both height and width)
-                transform: transformation to apply to the image (e.g., resize, normalization)
-            """
-            self.mode = mode
-            self.img_size = img_size
-            self.transform = transform
-            if mode == 'train':
-                self.img_dir = os.path.join(root, 'train_data', 'images')
-                self.gt_dir = os.path.join(root, 'train_data', 'ground-truth')
-            else:
-                self.img_dir = os.path.join(root, 'test_data', 'images')
-                self.gt_dir = os.path.join(root, 'test_data', 'ground-truth')
-            self.img_files = sorted([f for f in os.listdir(self.img_dir) if f.lower().endswith('.jpg')])
-        def __len__(self):
-            return len(self.img_files)
-        def __getitem__(self, idx):
-            img_name = self.img_files[idx]
-            img_path = os.path.join(self.img_dir, img_name)
-            # Ground truth file: assume filename pattern "GT_" + base name + ".mat"
-            gt_name = 'GT_' + os.path.splitext(img_name)[0] + '.mat'
-            gt_path = os.path.join(self.gt_dir, gt_name)
-            # Load image and keep a copy for visualization
-            img = Image.open(img_path).convert('RGB')
-            orig_img = img.copy()
-            orig_w, orig_h = img.size
-            if self.transform is not None:
-                img = self.transform(img)
-            else:
-                img = transforms.ToTensor()(img)
-                img = transforms.Resize((self.img_size, self.img_size))(img)
-            # Load ground truth using mat4py
-            mat = loadmat(gt_path)
-            try:
-                locations = mat['image_info']['location']
-            except KeyError:
-                locations = []
-            points = []
-            for p in locations:
-                if isinstance(p, list) and len(p) >= 2:
-                    points.append((float(p[0]), float(p[1])))
-            # Create an empty density map of size (img_size, img_size)
-            density = np.zeros((self.img_size, self.img_size), dtype=np.float32)
-            # Compute scaling factors (from original image to resized image)
-            scale_w = self.img_size / orig_w
-            scale_h = self.img_size / orig_h
-            for point in points:
-                x = point[0] * scale_w
-                y = point[1] * scale_h
-                x = min(self.img_size - 1, max(0, int(round(x))))
-                y = min(self.img_size - 1, max(0, int(round(y))))
-                density[y, x] += 1
-            # Apply Gaussian filter to spread the point annotations
-            density = gaussian_filter(density, sigma=4)
-            density = torch.from_numpy(density).unsqueeze(0)  # (1, H, W)
-            # Return three items
-            return img, density, orig_img
 
-    # Minimal model definition (should be replaced by your actual CACViT implementation)
-    def cacvit_single(**kwargs):
-        raise ImportError("Model definition not found. Please ensure 'train_cacvit_crowd.py' is in your PYTHONPATH.")
-
-# --------------------------
-# Function to convert normalized tensor back to a PIL image
-# --------------------------
-def tensor_to_pil(tensor):
-    # Assuming normalization with mean=[0.485,0.456,0.406] and std=[0.229,0.224,0.225]
-    inv_normalize = transforms.Normalize(
-        mean=[-0.485/0.229, -0.456/0.224, -0.406/0.225],
-        std=[1/0.229, 1/0.224, 1/0.225]
-    )
-    tensor = inv_normalize(tensor)
-    tensor = torch.clamp(tensor, 0, 1)
-    return transforms.ToPILImage()(tensor)
-
-# --------------------------
-# Evaluation and Visualization Function
-# --------------------------
-def evaluate_and_visualize(model, test_loader, device, num_visualizations=10):
+#############################################
+# YOLO-Based Exemplars Extraction
+#############################################
+def get_exemplars_from_yolo(pil_image, yolo_model, exemplar_transform, conf_threshold=0.5, num_exemplars=3):
     """
-    Evaluates the model on the test dataset and visualizes results.
-    For each sample, displays:
-      - Original image.
-      - Ground truth density map.
-      - Predicted density map.
-    The title shows ground truth count and predicted count.
+    Runs YOLO on the input PIL image to obtain bounding boxes with confidence >= conf_threshold.
+    Crops and resizes the regions to 64x64 and applies exemplar_transform.
     """
-    model.eval()
-    visualized = 0
-    with torch.no_grad():
-        # Using custom collate, each batch is a list of samples.
-        for batch in test_loader:
-            # Since batch_size is 1, get the single sample.
-            sample = batch[0]
-            # Check the number of items returned by the dataset
-            if len(sample) == 3:
-                image, gt_density, orig_img = sample
-            elif len(sample) == 2:
-                image, gt_density = sample
-                # Reconstruct the original image from the normalized tensor
-                orig_img = tensor_to_pil(image.cpu()[0])
-            else:
-                raise ValueError("Dataset __getitem__ must return 2 or 3 items.")
-
-            image = image.to(device).unsqueeze(0)       # (B, C, H, W)
-            gt_density = gt_density.to(device).unsqueeze(0)  # (B, 1, H, W)
-            output = model(image)                       # (B, H, W)
-            pred_count = output.sum().item()
-            gt_count = gt_density.sum().item()
-            pred_density = output.cpu().squeeze(0).numpy()
-            gt_density_np = gt_density.cpu().squeeze(0).numpy()
-
-            # Plot the original image, ground truth, and prediction.
-            fig, axs = plt.subplots(1, 3, figsize=(18, 6))
-            axs[0].imshow(orig_img)
-            axs[0].axis('off')
-            axs[0].set_title("Original Image")
-            axs[1].imshow(gt_density_np, cmap='jet')
-            axs[1].axis('off')
-            axs[1].set_title(f"GT Density Map\nCount: {gt_count:.2f}")
-            axs[2].imshow(pred_density, cmap='jet')
-            axs[2].axis('off')
-            axs[2].set_title(f"Predicted Density Map\nCount: {pred_count:.2f}")
-            plt.suptitle(f"GT Count: {gt_count:.2f} | Pred Count: {pred_count:.2f}", fontsize=16)
-            plt.tight_layout()
-            plt.show()
-
-            visualized += 1
-            if visualized >= num_visualizations:
+    results = yolo_model(pil_image)
+    # Assuming results[0].boxes.data is a tensor of shape (N, 6): [x1, y1, x2, y2, conf, cls]
+    boxes = results[0].boxes.data.cpu().numpy()
+    exemplars = []
+    for box in boxes:
+        if box[4] >= conf_threshold:
+            x1, y1, x2, y2 = box[:4]
+            x1, y1, x2, y2 = map(int, [x1, y1, x2, y2])
+            cropped = pil_image.crop((x1, y1, x2, y2))
+            cropped = cropped.resize((64, 64))
+            exemplars.append(cropped)
+            if len(exemplars) >= num_exemplars:
                 break
-
-# --------------------------
-# Custom collate function that returns the list of samples directly.
-# --------------------------
-def custom_collate(batch):
-    return batch
-
-# --------------------------
-# Argument Parsing and Main Function
-# --------------------------
-def parse_args():
-    import argparse
-    parser = argparse.ArgumentParser(description="Evaluate CACViT Model on PartA Test Data")
-    parser.add_argument('--dataset_path', type=str, default='datasets/partA', help='Path to the PartA dataset folder')
-    parser.add_argument('--img_size', type=int, default=384, help='Image size (images will be resized to img_size x img_size)')
-    parser.add_argument('--batch_size', type=int, default=1, help='Batch size for evaluation (use 1 for visualization)')
-    parser.add_argument('--num_workers', type=int, default=4, help='Number of DataLoader workers')
-    parser.add_argument('--model_path', type=str, default='cacvit_crowd.pth', help='Path to the saved model weights')
-    parser.add_argument('--device', type=str, default='cuda:0', help='Device to use for evaluation')
-    parser.add_argument('--num_visualizations', type=int, default=10, help='Number of samples to visualize')
-    return parser.parse_args()
-
-def main():
-    args = parse_args()
-    device = torch.device(args.device)
-
-    # Define evaluation transform (same as used during training)
-    eval_transform = transforms.Compose([
-        transforms.Resize((args.img_size, args.img_size)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                             std=[0.229, 0.224, 0.225])
-    ])
-
-    # Create the test dataset and DataLoader with the custom collate function
-    test_dataset = CrowdCountingDataset(root=args.dataset_path, mode='test', img_size=args.img_size, transform=eval_transform)
-    test_loader = torch.utils.data.DataLoader(
-        test_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        collate_fn=custom_collate
-    )
-
-    # Build and load the model
-    model = cacvit_single(img_size=args.img_size, patch_size=16, in_chans=3,
-                          embed_dim=768, depth=12, decoder_embed_dim=512, decoder_depth=3)
-    model = model.to(device)
-    state_dict = torch.load(args.model_path, map_location=device)
-    model.load_state_dict(state_dict)
-    print("Loaded model weights from", args.model_path)
-
-    # Evaluate and visualize results
-    evaluate_and_visualize(model, test_loader, device, num_visualizations=args.num_visualizations)
-
+    if len(exemplars) < num_exemplars:
+        if len(exemplars) == 0:
+            dummy_ex = Image.fromarray(np.zeros((64,64,3), dtype=np.uint8))
+            exemplars = [dummy_ex] * num_exemplars
+        else:
+            while len(exemplars) < num_exemplars:
+                exemplars.append(exemplars[-1])
+    exemplars = torch.stack([exemplar_transform(ex) for ex in exemplars])
+    return exemplars
+#############################################
+# Evaluation Code (MAE and MAPE metrics)
+#############################################
 if __name__ == '__main__':
-    main()
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    # Paths (update these paths as necessary)
+    test_img_dir = 'datasets/partA/test_data/images'
+    test_gt_dir = 'datasets/partA/test_data/ground_truth'
+    exemplars_dir = 'datasets/partA/examplars'
+
+    test_dataset = CrowdCountingDataset(
+        test_img_dir, test_gt_dir, exemplars_dir,
+        transform=transform, exemplar_transform=exemplar_transform, num_exemplars=3, resize_shape=(384,384)
+    )
+    test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=2, collate_fn=custom_collate_fn)
+
+    # Initialize model and load weights
+    model = CACViT(num_exemplars=3, img_size=384, patch_size=16, embed_dim=768).to(device)
+    checkpoint = torch.load("cacvit_crowd_counting.pth", map_location=device)
+    model.load_state_dict(checkpoint)
+    model.eval()
+
+    # Load YOLO model
+    yolo_model = YOLO("best.pt")
+
+    total_mae = 0.0
+    total_mape = 0.0
+    num_samples = 0
+    epsilon = 1e-6
+
+    with torch.no_grad():
+        for sample in test_loader:
+            # sample is a tuple: (image, gt_density, dummy_exemplars, scales, gt_count)
+            image, gt_density, _, scales, gt_counts = sample
+            # Un-normalize to get a PIL image for YOLO inference
+            inv_normalize = transforms.Normalize(
+                mean=[-0.485 / 0.229, -0.456 / 0.224, -0.406 / 0.225],
+                std=[1 / 0.229, 1 / 0.224, 1 / 0.225]
+            )
+            img_tensor = image.cpu().squeeze(0)
+            disp_img = inv_normalize(img_tensor)
+            disp_img = torch.clamp(disp_img, 0, 1)
+            pil_image = transforms.ToPILImage()(disp_img)
+
+            # Extract exemplars from YOLO
+            exemplars = get_exemplars_from_yolo(pil_image, yolo_model, exemplar_transform, conf_threshold=0.5,
+                                                num_exemplars=3)
+
+            image = image.to(device)
+            scales = scales.to(device)
+            exemplars = exemplars.to(device)
+            output_density = model([image, exemplars, scales])  # (1, 384, 384)
+            pred_count = output_density.sum().item()
+            gt_count = float(gt_counts[0])
+            total_mae += abs(pred_count - gt_count)
+            total_mape += abs(pred_count - gt_count) / (gt_count + epsilon)
+            num_samples += 1
+
+    mae = total_mae / num_samples
+    mape = (total_mape / num_samples) * 100
+
+    print(f"Test MAE: {mae:.2f}")
+    print(f"Test MAPE: {mape:.2f}%")
+    with torch.no_grad():
+        # Visualize one sample
+        sample = next(iter(test_loader))
+        test_img, test_gt_density, test_exemplars, test_scales, gt_counts = sample
+        test_img = test_img.to(device)
+        test_exemplars = test_exemplars.to(device)
+        test_scales = test_scales.to(device)
+        output_density = model([test_img, test_exemplars, test_scales])
+        output_density_np = output_density.squeeze(0).cpu().numpy()
+        gt_density_np = test_gt_density.squeeze(0).cpu().numpy()
+        pred_count = output_density_np.sum()
+        gt_count = float(gt_counts[0])
+
+        # Convert normalized image back to PIL image for display (reverse normalization)
+        inv_normalize = transforms.Normalize(
+            mean=[-0.485/0.229, -0.456/0.224, -0.406/0.225],
+            std=[1/0.229, 1/0.224, 1/0.225]
+        )
+        disp_img = test_img.squeeze(0).cpu()
+        disp_img = inv_normalize(disp_img)
+        disp_img = torch.clamp(disp_img, 0, 1)
+        disp_img = transforms.ToPILImage()(disp_img)
+
+        plt.figure(figsize=(18,6))
+        plt.subplot(1,3,1)
+        plt.imshow(disp_img)
+        plt.title("Input Image")
+        plt.axis('off')
+
+        plt.subplot(1,3,2)
+        plt.imshow(gt_density_np, cmap='jet')
+        plt.title(f"GT Density Map\nCount: {gt_count:.2f}")
+        plt.axis('off')
+
+        plt.subplot(1,3,3)
+        plt.imshow(output_density_np, cmap='jet')
+        plt.title(f"Predicted Density Map\nCount: {pred_count:.2f}")
+        plt.axis('off')
+
+        plt.suptitle("Test Evaluation Sample", fontsize=16)
+        plt.tight_layout()
+        plt.show()
