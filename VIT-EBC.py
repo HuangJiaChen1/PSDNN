@@ -78,6 +78,7 @@ class ShanghaiTechADataset_ViT(Dataset):
                 points = []
             try:
                 image = Image.open(img_path).convert("RGB")
+                image = image.resize((960, 960), Image.Resampling.BILINEAR)
             except Exception as e:
                 print(f"Error opening {img_path}: {e}")
                 continue
@@ -258,7 +259,7 @@ def predict_image(model, image_path, transform, device):
     return image, density_map, total_count
 
 
-def visualize_image_prediction(image, density_map, total_count):
+def visualize_image_prediction(image, density_map, total_count,gt_total):
     """
     Visualizes the image with block-level predictions and the density heatmap.
     """
@@ -281,7 +282,7 @@ def visualize_image_prediction(image, density_map, total_count):
     plt.figure(figsize=(12, 6))
     plt.subplot(1, 2, 1)
     plt.imshow(image_with_boxes)
-    plt.title(f"Predicted Total Count: {total_count:.1f}")
+    plt.title(f"Predicted Total Count: {total_count:.1f}, Ground truth: {gt_total}")
     plt.axis("off")
     plt.subplot(1, 2, 2)
     plt.imshow(density_map, interpolation="nearest", cmap="hot")
@@ -300,10 +301,17 @@ if __name__ == "__main__":
     torch.multiprocessing.freeze_support()
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
+    # transform = T.Compose([
+    #     T.Resize((BLOCK_SIZE, BLOCK_SIZE)),
+    #     T.ToTensor(),
+    #     T.Normalize(mean=[0.485, 0.456, 0.406],
+    #                 std=[0.229, 0.224, 0.225])
+    # ])
+
     transform = T.Compose([
+        T.Resize((BLOCK_SIZE, BLOCK_SIZE)),
         T.ToTensor(),
-        T.RandomHorizontalFlip(),
-        T.RandomResizedCrop((BLOCK_SIZE, BLOCK_SIZE), scale=(0.8, 1.0), ratio=(0.9, 1.1)),
+        T.RandomHorizontalFlip(0.3),
         T.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
         T.Normalize(mean=[0.485, 0.456, 0.406],
                     std=[0.229, 0.224, 0.225])
@@ -317,8 +325,8 @@ if __name__ == "__main__":
     # train_dataset, val_dataset = torch.utils.data.random_split(full_dataset, [train_size, val_size])
     #
     # # Create dataloaders for each split.
-    # train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True, num_workers=4)
-    # val_loader = DataLoader(val_dataset, batch_size=64, shuffle=False, num_workers=4)
+    # train_loader = DataLoader(train_dataset, batch_size=128, shuffle=True, num_workers=4)
+    # val_loader = DataLoader(val_dataset, batch_size=128, shuffle=False, num_workers=4)
     train_root = "datasets/partA/train_data"  # adjust path as needed
     train_dataset = ShanghaiTechADataset_ViT(root_dir=train_root, block_size=BLOCK_SIZE, transform=transform)
     train_loader = DataLoader(train_dataset, batch_size=128, shuffle=True, num_workers=4)
@@ -330,7 +338,7 @@ if __name__ == "__main__":
 
     optimizer = optim.Adam(model.parameters(), lr=1e-4)
 
-    num_epochs = 10
+    num_epochs = 20
     for epoch in range(num_epochs):
         train_loss = train_epoch(model, train_loader, optimizer, device)
         # val_loss = evaluate(model, val_loader, device)
@@ -358,4 +366,4 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"Error loading GT: {e}")
 
-    visualize_image_prediction(image, density_map, total_count)
+    visualize_image_prediction(image, density_map, total_count,gt_total)

@@ -87,6 +87,7 @@ def predict_image(model, image_path, transform, device):
     and returns the full density map and total predicted count.
     """
     image = Image.open(image_path).convert("RGB")
+    image = image.resize((960, 960), Image.Resampling.BILINEAR)
     width, height = image.size
     n_blocks_x = width // BLOCK_SIZE
     n_blocks_y = height // BLOCK_SIZE
@@ -141,9 +142,10 @@ def evaluate_model(model, test_images_dir, test_gt_dir, transform, device):
             print(f"Error loading GT for {img_file}: {e}")
             gt_total = 0
         gt_counts.append(gt_total)
+
         # comment here
-        visualize_image_prediction(i, d, pred_total)
-        print(f"{img_file}: Predicted = {pred_total:.1f}, Ground Truth = {gt_total}")
+        # print(f"{img_file}: Predicted = {pred_total:.1f}, Ground Truth = {gt_total}")
+        # visualize_image_prediction(i, d, pred_total,gt_total)
 
     predicted_counts = np.array(predicted_counts)
     gt_counts = np.array(gt_counts)
@@ -153,7 +155,7 @@ def evaluate_model(model, test_images_dir, test_gt_dir, transform, device):
 
     return mae, mape, predicted_counts, gt_counts
 
-def visualize_image_prediction(image, density_map, total_count):
+def visualize_image_prediction(image, density_map, total_count,gt_total):
     """
     Visualizes the image with block-level predictions and the density heatmap.
     """
@@ -176,7 +178,7 @@ def visualize_image_prediction(image, density_map, total_count):
     plt.figure(figsize=(12, 6))
     plt.subplot(1, 2, 1)
     plt.imshow(image_with_boxes)
-    plt.title(f"Predicted Total Count: {total_count:.1f}")
+    plt.title(f"Predicted Total Count: {total_count:.1f}, Ground truth: {gt_total}")
     plt.axis("off")
     plt.subplot(1, 2, 2)
     plt.imshow(density_map, interpolation="nearest", cmap="hot")
@@ -193,25 +195,25 @@ if __name__ == "__main__":
     # Set device.
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # transform = T.Compose([
-    #     T.Resize((BLOCK_SIZE, BLOCK_SIZE)),
-    #     T.ToTensor(),
-    #     T.Normalize(mean=[0.485, 0.456, 0.406],
-    #                 std=[0.229, 0.224, 0.225])
-    # ])
-
-    # more advanced transform
     transform = T.Compose([
+        T.Resize((BLOCK_SIZE, BLOCK_SIZE)),
         T.ToTensor(),
-        T.RandomHorizontalFlip(),
-        T.RandomResizedCrop((BLOCK_SIZE, BLOCK_SIZE), scale=(0.8, 1.0), ratio=(0.9, 1.1)),
-        T.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
         T.Normalize(mean=[0.485, 0.456, 0.406],
                     std=[0.229, 0.224, 0.225])
     ])
 
-    test_images_dir = "datasets/partB/test_data/images"  # Adjust as needed.
-    test_gt_dir = "datasets/partB/test_data/ground_truth"  # Adjust as needed.
+    # more advanced transform
+    # transform = T.Compose([
+    #     T.Resize((BLOCK_SIZE, BLOCK_SIZE)),
+    #     T.ToTensor(),
+    #     T.RandomHorizontalFlip(0.3),
+    #     T.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
+    #     T.Normalize(mean=[0.485, 0.456, 0.406],
+    #                 std=[0.229, 0.224, 0.225])
+    # ])
+
+    test_images_dir = "datasets/partA/test_data/images"  # Adjust as needed.
+    test_gt_dir = "datasets/partA/test_data/ground_truth"  # Adjust as needed.
 
     model = ViT_EBC_Big(img_size=BLOCK_SIZE, patch_size=4, in_chans=3, embed_dim=256, depth=8, num_heads=8,
                         num_classes=NUM_CLASSES)
