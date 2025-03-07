@@ -9,7 +9,7 @@ from PIL import Image
 import matplotlib.pyplot as plt
 import glob
 # timm modules for Vision Transformer components
-from timm.models.vision_transformer import PatchEmbed, Block
+from timm_check.models.vision_transformer import PatchEmbed, Block
 
 
 # -----------------------------------------------------------------------------

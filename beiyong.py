@@ -10,6 +10,7 @@ from mat4py import loadmat
 import torchvision.transforms as transforms
 import timm
 import matplotlib.pyplot as plt
+from einops import rearrange,repeat
 
 
 #############################################
@@ -143,11 +144,8 @@ exemplar_transform = transforms.Compose([
 ])
 
 
-#############################################
-# Patch Embedding Module (adapted from timm)
-#############################################
 class PatchEmbed(nn.Module):
-    def __init__(self, img_size=224, patch_size=16, in_chans=3, embed_dim=768):
+    def __init__(self, img_size=224, patch_size=16, in_chans=3, embed_dim=1024):
         super().__init__()
         img_size = (img_size, img_size) if isinstance(img_size, int) else img_size
         patch_size = (patch_size, patch_size) if isinstance(patch_size, int) else patch_size
@@ -156,20 +154,14 @@ class PatchEmbed(nn.Module):
         self.patch_size = patch_size
         self.num_patches = num_patches
         self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
-
     def forward(self, x):
-        B, C, H, W = x.shape
-        assert H == self.img_size[0] and W == self.img_size[
-            1], f"Input image size ({H}*{W}) doesn't match model ({self.img_size[0]}*{self.img_size[1]})."
-        x = self.proj(x).flatten(2).transpose(1, 2)  # (B, num_patches, embed_dim)
+        B,C,H,W = x.shape
+        assert H==self.img_size[0] and W==self.img_size[1], f"Input image size ({H}x{W}) doesn't match model ({self.img_size[0]}x{self.img_size[1]})"
+        x = self.proj(x).flatten(2).transpose(1,2)
         return x
 
-
-#############################################
-# CACViT Model Definition
-#############################################
 class CACViT(nn.Module):
-    def __init__(self, num_exemplars=3, img_size=384, patch_size=16, embed_dim=768):
+    def __init__(self, num_exemplars=3, img_size=384, patch_size=16, embed_dim=1024):
         super(CACViT, self).__init__()
         self.num_exemplars = num_exemplars
         self.img_size = img_size
@@ -177,9 +169,9 @@ class CACViT(nn.Module):
         self.num_patches = (img_size // patch_size) ** 2
         self.embed_dim = embed_dim
 
-        # Vision Transformer backbone (encoder) from timm
-        self.vit = timm.create_model('vit_base_patch16_384', pretrained=True, num_classes=0)
-        # Use the patch embedding and positional embeddings from the pretrained ViT.
+        # Use vit_large_patch16_384 as encoder backbone
+        self.vit = timm.create_model('vit_large_patch16_384', pretrained=True, num_classes=0)
+        # The vit_large model comes with a patch_embed and positional embeddings (both of dimension 1024).
 
         # Separate PatchEmbed for exemplars (64x64 input)
         self.patch_embed_exemplar = PatchEmbed(img_size=64, patch_size=16, in_chans=3, embed_dim=embed_dim)
@@ -187,14 +179,15 @@ class CACViT(nn.Module):
         self.exemplar_pos_embed = nn.Parameter(torch.zeros(1, self.num_patches_exemplar, embed_dim))
         nn.init.trunc_normal_(self.exemplar_pos_embed, std=0.02)
 
-        # Positional embeddings for combining image and exemplar features
+        # Positional embeddings for combining image and exemplar features.
+        # We are concatenating image tokens (num_patches) and exemplar tokens (num_exemplars).
         self.combined_pos_embed = nn.Parameter(torch.zeros(1, self.num_patches + num_exemplars, embed_dim))
         nn.init.trunc_normal_(self.combined_pos_embed, std=0.02)
 
         # Scale embedding for exemplars
         self.scale_embed = nn.Linear(2, embed_dim)
 
-        # Decoder to upsample features to a density map
+        # Decoder: Upsample from embed_dim to a density map.
         self.decoder = nn.Sequential(
             nn.ConvTranspose2d(embed_dim, 256, kernel_size=4, stride=2, padding=1),
             nn.ReLU(),
@@ -205,13 +198,29 @@ class CACViT(nn.Module):
             nn.Conv2d(64, 1, kernel_size=3, padding=1),
             nn.ReLU()  # Ensure non-negative density values
         )
-
+    def scale_embedding(self, exemplars, scale_infos):
+        # We use method 1 from your code: add width and height maps.
+        bs, n, c, h, w = exemplars.shape
+        scales_batch = []
+        for i in range(bs):
+            scales_i = []
+            for j in range(n):
+                w_scale = torch.linspace(0, scale_infos[i, j, 0], w)
+                w_scale = repeat(w_scale, 'w->h w', h=h).unsqueeze(0)
+                h_scale = torch.linspace(0, scale_infos[i, j, 1], h)
+                h_scale = repeat(h_scale, 'h->h w', w=w).unsqueeze(0)
+                scale = w_scale + h_scale
+                scales_i.append(scale)
+            scales_i = torch.stack(scales_i)
+            scales_batch.append(scales_i)
+        scales_batch = torch.stack(scales_batch).to(exemplars.device)
+        exemplars = torch.cat((exemplars, scales_batch), dim=2)
+        return exemplars
     def forward(self, inputs):
         samples, boxes, scales = inputs  # samples: (B, 3, 384, 384); boxes: (B, num_exemplars, 3, 64, 64)
         batch_size = samples.shape[0]
-
+        boxes = self.scale_embedding(boxes, scales)
         # --- Process Query Image through ViT ---
-        # Use pretrained ViT patch embedding and positional embeddings.
         x = self.vit.patch_embed(samples)  # (B, num_patches, embed_dim)
         x = x + self.vit.pos_embed[:, 1:, :]  # (B, num_patches, embed_dim)
         cls_token = self.vit.cls_token.expand(batch_size, -1, -1)  # (B, 1, embed_dim)
@@ -220,33 +229,29 @@ class CACViT(nn.Module):
         for blk in self.vit.blocks:
             x = blk(x)
         img_features = self.vit.norm(x)  # (B, num_patches+1, embed_dim)
-        img_features = img_features[:, 1:, :]  # Remove CLS token --> (B, num_patches, embed_dim)
+        img_features = img_features[:, 1:, :]  # (B, num_patches, embed_dim)
 
         # --- Process Exemplars ---
         exemplars = boxes.view(batch_size * self.num_exemplars, 3, 64, 64)
         exemplar_features = self.patch_embed_exemplar(exemplars)  # (B*num_exemplars, num_patches_ex, embed_dim)
         exemplar_features = exemplar_features + self.exemplar_pos_embed
-        exemplar_features = exemplar_features.view(batch_size, self.num_exemplars, self.num_patches_exemplar,
-                                                   self.embed_dim)
-        exemplar_features = exemplar_features.mean(dim=2)  # Average over patches: (B, num_exemplars, embed_dim)
+        exemplar_features = exemplar_features.view(batch_size, self.num_exemplars, self.num_patches_exemplar, self.embed_dim)
+        exemplar_features = exemplar_features.mean(dim=2)  # (B, num_exemplars, embed_dim)
         scale_features = self.scale_embed(scales)  # (B, num_exemplars, embed_dim)
-        exemplar_features = exemplar_features + scale_features  # (B, num_exemplars, embed_dim)
+        exemplar_features = exemplar_features + scale_features
 
         # --- Combine Image and Exemplar Features ---
-        combined_features = torch.cat([img_features, exemplar_features],
-                                      dim=1)  # (B, num_patches+num_exemplars, embed_dim)
+        combined_features = torch.cat([img_features, exemplar_features], dim=1)  # (B, num_patches+num_exemplars, embed_dim)
         combined_features = combined_features + self.combined_pos_embed
         combined_features = self.vit.norm(combined_features)
 
-        # Extract only the image features for density prediction and reshape
+        # Extract only image tokens and reshape for the decoder
         img_features = combined_features[:, :self.num_patches, :]  # (B, num_patches, embed_dim)
-        h = w = self.img_size // self.patch_size  # For 384 and 16 -> 24
+        h = w = self.img_size // self.patch_size  # For 384/16 -> 24
         img_features = img_features.permute(0, 2, 1).reshape(batch_size, self.embed_dim, h, w)
 
-        # --- Decode to Density Map ---
         density_map = self.decoder(img_features)  # (B, 1, H_dec, W_dec)
-        density_map = F.interpolate(density_map, size=(self.img_size, self.img_size), mode='bilinear',
-                                    align_corners=False)
+        density_map = F.interpolate(density_map, size=(self.img_size, self.img_size), mode='bilinear', align_corners=False)
         return density_map.squeeze(1)  # (B, H, W)
 
 
@@ -258,9 +263,8 @@ def custom_collate_fn(batch):
     density_maps = torch.stack([item[1] for item in batch])
     exemplars = torch.stack([item[2] for item in batch])
     scales = torch.stack([item[3] for item in batch])
-    gt_counts = [item[4] for item in batch]  # This returns a list of counts
+    gt_counts = [item[4] for item in batch]  # List of integers
     return images, density_maps, exemplars, scales, gt_counts
-
 
 
 #############################################
@@ -332,6 +336,12 @@ if __name__ == '__main__':
             gt_density = gt_density.to(device)
             exemplars = exemplars.to(device)
             scales = scales.to(device)
+            if isinstance(gt_count, torch.Tensor):
+                # If gt_count is a batch of counts, sum and then convert to a scalar:
+                gt_count = gt_count.sum().cpu().item()
+            else:
+                # If it's a list of ints, sum them:
+                gt_count = sum(gt_count)
 
             optimizer.zero_grad()
             inputs = [images, exemplars, scales]
@@ -340,7 +350,13 @@ if __name__ == '__main__':
             # Resize ground truth density map if needed
             gt_density_resized = F.interpolate(gt_density.unsqueeze(1), size=(384, 384), mode='bilinear',
                                                align_corners=False).squeeze(1)
-            loss = criterion(pred_density, gt_density_resized)
+            pred_count = pred_density.cpu().detach().numpy().sum()
+            mae_loss = abs(gt_count - pred_count)
+
+            loss = (pred_density - gt_density_resized) ** 2
+            loss = loss.mean()  # Ensure loss is a scalar if needed
+            # loss += 0.00001 * mae_loss
+
             loss.backward()
             optimizer.step()
 
@@ -351,7 +367,7 @@ if __name__ == '__main__':
 
         avg_loss = total_loss / len(train_loader)
         print(f"Epoch [{epoch}/{num_epochs}] Average Loss: {avg_loss:.6f}")
-        if epoch % 5 == 0:
+        if epoch % 1 == 0:
             checkpoint_data = {
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),

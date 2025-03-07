@@ -7,7 +7,7 @@ import torchvision.transforms as transforms
 from PIL import Image
 import matplotlib.pyplot as plt
 from mat4py import loadmat
-from timm.models.vision_transformer import PatchEmbed, Block
+from timm_check.models.vision_transformer import PatchEmbed, Block
 
 # --------------------------
 # Helper functions: Gaussian kernel and density map generation

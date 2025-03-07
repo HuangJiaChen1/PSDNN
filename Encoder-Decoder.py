@@ -10,7 +10,7 @@ import matplotlib.pyplot as plt
 from mat4py import loadmat
 
 # Import timm's modules for the Vision Transformer
-from timm.models.vision_transformer import PatchEmbed, Block
+from timm_check.models.vision_transformer import PatchEmbed, Block
 
 # --------------------------
 # Helper functions: Gaussian kernel and density map generation

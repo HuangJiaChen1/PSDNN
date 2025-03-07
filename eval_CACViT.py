@@ -4,7 +4,7 @@ from PIL.Image import Image
 from torch.utils.data import Dataset, DataLoader
 import torchvision.transforms as transforms
 import matplotlib.pyplot as plt
-from CACViT import CrowdCountingDataset, transform, exemplar_transform, CACViT, custom_collate_fn
+from YCV import CrowdCountingDataset, transform, exemplar_transform, CACViT, custom_collate_fn
 from ultralytics import YOLO
 
 
