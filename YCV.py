@@ -10,10 +10,9 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from mat4py import loadmat
 import torchvision.transforms as transforms
-import timm_check
 import matplotlib.pyplot as plt
 from einops import rearrange,repeat
-from timm_check.models.vision_transformer import PatchEmbed
+from timm.models.vision_transformer import PatchEmbed
 from Blocks import Block
 from pos_embed import get_2d_sincos_pos_embed
 
@@ -99,7 +98,7 @@ class CrowdCountingDataset(Dataset):
             image = self.transform(image)  # (C, H, W)
         if self.exemplar_transform:
             exemplars = torch.stack([self.exemplar_transform(ex) for ex in exemplars])  # (num_exemplars, C, H, W)
-        density_map = torch.from_numpy(density_map).float()  # (H, W)
+        density_map = torch.from_numpy(density_map).float()*60  # (H, W)
 
         return image, density_map, exemplars, scales, len(locations)
 
@@ -440,11 +439,11 @@ if __name__ == '__main__':
         mlp_ratio=4, norm_layer=partial(nn.LayerNorm, eps=1e-6))
     model = model.to(device)
     # Dataset paths (adjust these paths as necessary)
-    train_img_dir = 'datasets/partA/train_data/images'
-    train_gt_dir = 'datasets/partA/train_data/ground_truth'
+    train_img_dir = 'datasets/partB/train_data/images'
+    train_gt_dir = 'datasets/partB/train_data/ground_truth'
     exemplars_dir = 'datasets/partA/examplars'  # Ensure exemplars exist here
-    test_img_dir = 'datasets/partA/test_data/images'
-    test_gt_dir = 'datasets/partA/test_data/ground_truth'
+    test_img_dir = 'datasets/partB/test_data/images'
+    test_gt_dir = 'datasets/partB/test_data/ground_truth'
 
     # Create DataLoaders for training and evaluation
     train_dataset = CrowdCountingDataset(
@@ -490,6 +489,8 @@ if __name__ == '__main__':
         start_epoch = 1
         print("No checkpoint found. Starting training from scratch.")
     print("Starting training...")
+    model.load_state_dict(torch.load("best-model.pth")['model'])
+    # optimizer.load_state_dict(torch.load("best_model.pth")[['optimizer']])
     for epoch in range(start_epoch, num_epochs + 1):
         model.train()
         total_loss = 0.0
@@ -506,7 +507,16 @@ if __name__ == '__main__':
             # Resize ground truth density map if needed
             gt_density_resized = F.interpolate(gt_density.unsqueeze(1), size=(384, 384), mode='bilinear',
                                                align_corners=False).squeeze(1)
-            loss = criterion(pred_density, gt_density_resized) * 60
+            pred_count = pred_density.cpu().detach().numpy().sum()/60
+
+            loss = (pred_density - gt_density_resized) ** 2
+            loss = loss.mean()
+
+            # mape_loss = abs(gt_count - pred_count)/gt_count
+            # loss = (pred_density - gt_density_resized) ** 2
+            # loss = loss.mean()  # Ensure loss is a scalar if needed
+            # loss += 0.2 * mape_loss
+
             loss.backward()
             optimizer.step()
 
@@ -529,7 +539,7 @@ if __name__ == '__main__':
             saved_checkpoints.append(checkpoint_filename)
 
             # If more than 3 checkpoints exist, delete the oldest one
-            if len(saved_checkpoints) > 3:
+            if len(saved_checkpoints) > 1 :
                 oldest_checkpoint = saved_checkpoints.pop(0)
                 if os.path.exists(oldest_checkpoint):
                     os.remove(oldest_checkpoint)
@@ -548,7 +558,7 @@ if __name__ == '__main__':
                 output_density_np = output_density.squeeze(0).cpu().numpy()
                 gt_density_np = test_gt_density.squeeze(0).cpu().numpy()
 
-                pred_count = output_density_np.sum()
+                pred_count = output_density_np.sum()/60
                 gt_density_resized = F.interpolate(test_gt_density.unsqueeze(1), size=(384, 384), mode='bilinear',
                                                    align_corners=False).squeeze(1)
                 loss = criterion(gt_density_resized, output_density)
@@ -585,7 +595,7 @@ if __name__ == '__main__':
 
                 plt.suptitle(f"Epoch {epoch + 1} Evaluation", fontsize=16)
                 plt.tight_layout()
-                plt.savefig("CACVIT_VIS.png")
+                plt.savefig("YCV_VIS.png")
 
     # Save the final model
     torch.save(model.state_dict(), 'YCV.pth')

@@ -181,7 +181,7 @@ class CACViT(nn.Module):
 
         # Positional embeddings for combining image and exemplar features.
         # We are concatenating image tokens (num_patches) and exemplar tokens (num_exemplars).
-        self.combined_pos_embed = nn.Parameter(torch.zeros(1, self.num_patches + num_exemplars, embed_dim))
+        self.combined_pos_embed = nn.Parameter(torch.zeros(1, self.num_patches + num_exemplars +1, embed_dim))
         nn.init.trunc_normal_(self.combined_pos_embed, std=0.02)
 
         # Scale embedding for exemplars
@@ -232,13 +232,13 @@ class CACViT(nn.Module):
         img_features = img_features[:, 1:, :]  # (B, num_patches, embed_dim)
 
         # --- Process Exemplars ---
-        exemplars = boxes.view(batch_size * self.num_exemplars, 3, 64, 64)
+        exemplars = boxes.view(batch_size * (self.num_exemplars+1), 3, 64, 64)
         exemplar_features = self.patch_embed_exemplar(exemplars)  # (B*num_exemplars, num_patches_ex, embed_dim)
         exemplar_features = exemplar_features + self.exemplar_pos_embed
-        exemplar_features = exemplar_features.view(batch_size, self.num_exemplars, self.num_patches_exemplar, self.embed_dim)
+        exemplar_features = exemplar_features.view(batch_size, self.num_exemplars+1, self.num_patches_exemplar, self.embed_dim)
         exemplar_features = exemplar_features.mean(dim=2)  # (B, num_exemplars, embed_dim)
-        scale_features = self.scale_embed(scales)  # (B, num_exemplars, embed_dim)
-        exemplar_features = exemplar_features + scale_features
+        # scale_features = self.scale_embed(scales)  # (B, num_exemplars, embed_dim)
+        # exemplar_features = exemplar_features + scale_features
 
         # --- Combine Image and Exemplar Features ---
         combined_features = torch.cat([img_features, exemplar_features], dim=1)  # (B, num_patches+num_exemplars, embed_dim)
@@ -275,7 +275,7 @@ if __name__ == '__main__':
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     # Initialize model
-    model = CACViT(num_exemplars=3, img_size=384, patch_size=16, embed_dim=768).to(device)
+    model = CACViT(num_exemplars=3, img_size=384, patch_size=16, embed_dim=1024).to(device)
 
     # Dataset paths (adjust these paths as necessary)
     train_img_dir = 'datasets/partA/train_data/images'

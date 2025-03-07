@@ -14,6 +14,84 @@ from einops import rearrange, repeat
 from torch.cuda.amp import autocast, GradScaler
 
 #############################################
+# Official Bayesian Loss Modules
+#############################################
+class Bay_Loss(nn.Module):
+    def __init__(self, use_background, device):
+        super(Bay_Loss, self).__init__()
+        self.device = device
+        self.use_bg = use_background
+
+    def forward(self, prob_list, target_list, pre_density):
+        loss = 0
+        # Iterate over each sample in the batch
+        for idx, prob in enumerate(prob_list):
+            if prob is None:  # image contains no annotation points
+                pre_count = torch.sum(pre_density[idx])
+                target = torch.zeros((1,), dtype=torch.float32, device=self.device)
+            else:
+                # number of labels (if use_bg, last row is for background)
+                N = prob.shape[0]
+                if self.use_bg:
+                    # For each annotation, target count is 1 for foreground; background target is 0.
+                    target = torch.zeros((N,), dtype=torch.float32, device=self.device)
+                    target[:-1] = 1.0
+                else:
+                    target = torch.ones((N,), dtype=torch.float32, device=self.device)
+                # Flatten predicted density (H x W) into a vector (1 x (H*W))
+                pre_count = torch.sum(pre_density[idx].view(1, -1) * prob, dim=1)
+            loss += torch.sum(torch.abs(target - pre_count))
+        loss = loss / len(prob_list)
+        return loss
+
+class Post_Prob(nn.Module):
+    def __init__(self, sigma, c_size, stride, background_ratio, use_background, device):
+        super(Post_Prob, self).__init__()
+        assert c_size % stride == 0, "c_size must be divisible by stride"
+        self.sigma = sigma
+        self.bg_ratio = background_ratio
+        self.device = device
+        # Build a coordinate grid for the density map (c_size x c_size) with given stride.
+        self.cood = torch.arange(0, c_size, step=stride, dtype=torch.float32, device=device) + stride / 2
+        self.cood = self.cood.unsqueeze(0)  # shape (1, num_cells)
+        self.softmax = torch.nn.Softmax(dim=0)
+        self.use_bg = use_background
+
+    def forward(self, points, st_sizes):
+        # points: list (length B) of tensors (each shape (N_i, 2)) containing annotation coordinates in density map space.
+        num_points_per_image = [p.shape[0] for p in points]
+        if len(points) > 0 and any(p.numel() > 0 for p in points):
+            all_points = torch.cat(points, dim=0)
+            x = all_points[:, 0].unsqueeze(1)
+            y = all_points[:, 1].unsqueeze(1)
+            # Compute squared distances from each annotation to each coordinate in self.cood (for both x and y)
+            x_dis = -2 * torch.matmul(x, self.cood) + x * x + self.cood * self.cood
+            y_dis = -2 * torch.matmul(y, self.cood) + y * y + self.cood * self.cood
+            # Expand dimensions and add: result shape (total_points, num_cells, num_cells)
+            x_dis = x_dis.unsqueeze(1)
+            y_dis = y_dis.unsqueeze(2)
+            dis = x_dis + y_dis
+            dis = dis.view(dis.size(0), -1)  # shape: (total_points, num_cells*num_cells)
+            dis_list = torch.split(dis, num_points_per_image)
+            prob_list = []
+            for dis_img, st_size in zip(dis_list, st_sizes):
+                if dis_img.numel() > 0:
+                    if self.use_bg:
+                        # Use a fixed background constant: shape (1, num_cells*num_cells)
+                        bg_value = (st_size * self.bg_ratio) ** 2
+                        bg_dis = torch.full((1, dis_img.size(1)), bg_value, device=self.device, dtype=dis_img.dtype)
+                        dis_img = torch.cat([dis_img, bg_dis], 0)
+                    dis_img = -dis_img / (2.0 * self.sigma ** 2)
+                    dis_img = torch.clamp(dis_img, min=-100, max=100)  # Avoid extreme values.
+                    prob = self.softmax(dis_img)
+                else:
+                    prob = None
+                prob_list.append(prob)
+        else:
+            prob_list = [None for _ in range(len(points))]
+        return prob_list
+
+#############################################
 # Dataset Definition
 #############################################
 class CrowdCountingDataset(Dataset):
@@ -257,6 +335,81 @@ def custom_collate_fn(batch):
     locations = [item[4] for item in batch]
     return images, density_maps, exemplars, scales, locations
 
+
+def bayesian_loss(pred_density, ann_coords, sigma=8.0, d=None):
+    """
+    Computes the Bayesian loss for crowd counting as described in
+    "Bayesian Loss for Crowd Count Estimation with Point Supervision".
+
+    Args:
+        pred_density (Tensor): predicted density map of shape (H, W).
+        ann_coords (Tensor): ground-truth annotation coordinates of shape (N, 2)
+                             (each row is the (x,y) coordinate of an annotated head).
+        sigma (float): Gaussian kernel parameter; recommended value is 8.0.
+        d (float or None): if provided, the background margin parameter (e.g. 15% of the image's shorter side).
+                           If d is None, then the basic Bayesian loss is computed.
+
+    Returns:
+        loss (Tensor): a scalar loss value.
+    """
+    # Get image dimensions and flatten predicted density map.
+    H, W = pred_density.shape
+    M = H * W
+    D_flat = pred_density.view(-1)  # shape: (M,)
+
+    # Create a grid of pixel coordinates (assume integer coordinates starting at 0)
+    xs = torch.arange(W, device=pred_density.device, dtype=torch.float32)
+    ys = torch.arange(H, device=pred_density.device, dtype=torch.float32)
+    grid_y, grid_x = torch.meshgrid(ys, xs, indexing='ij')
+    pixel_coords = torch.stack([grid_x.flatten(), grid_y.flatten()], dim=1)  # (M, 2)
+
+    # ann_coords should be a tensor of shape (N, 2)
+    N = ann_coords.shape[0]
+
+    # Compute squared Euclidean distances from every pixel to every annotation.
+    # Resulting shape: (M, N)
+    diff = pixel_coords.unsqueeze(1) - ann_coords.unsqueeze(0)  # (M, N, 2)
+    dist2 = torch.sum(diff ** 2, dim=2)  # (M, N)
+
+    # Compute the likelihood (using a Gaussian kernel) for each pixel given each annotation:
+    # p(x_m | y_n) ∝ exp( -||x_m - z_n||^2 / (2*sigma^2) )
+    L = torch.exp(-dist2 / (2 * sigma ** 2))  # shape: (M, N)
+
+    if d is None:
+        # ----- Basic Bayesian Loss -----
+        # Compute posterior probability: p(y_n | x_m) = L / (sum_n L)
+        sum_L = torch.sum(L, dim=1, keepdim=True) + 1e-8
+        P = L / sum_L  # shape: (M, N)
+        # Expected count for each annotation:
+        # E[c_n] = sum_{m=1}^M p(y_n|x_m) * D(x_m)
+        E_counts = torch.matmul(P.transpose(0, 1), D_flat)  # shape: (N,)
+        # The ground truth count per annotated head is 1.
+        loss = torch.mean(torch.abs(1 - E_counts))
+        return loss
+    else:
+        # ----- Enhanced Bayesian Loss with Background Modeling (BAYESIAN+) -----
+        # For each pixel, we compute the distance to its nearest annotation.
+        d_min, _ = torch.min(torch.sqrt(dist2 + 1e-8), dim=1)  # shape: (M,)
+        # Compute the background likelihood:
+        # p(x_m | y0) ∝ exp(- (d - d_min)^2 / (2*sigma^2) )
+        L_bg = torch.exp(-((d - d_min) ** 2) / (2 * sigma ** 2))  # shape: (M,)
+
+        # Denominator for the posterior: sum_{n=1}^{N} L + L_bg.
+        denom = torch.sum(L, dim=1, keepdim=True) + L_bg.unsqueeze(1) + 1e-8  # (M, 1)
+        # Posterior for foreground (each annotation):
+        P_fg = L / denom  # (M, N)
+        # Posterior for background:
+        P_bg = L_bg / (torch.sum(L, dim=1) + L_bg + 1e-8)  # (M,)
+
+        # Expected counts:
+        E_fg = torch.matmul(P_fg.transpose(0, 1), D_flat)  # Expected count for each head, shape: (N,)
+        E_bg = torch.sum(P_bg * D_flat)  # Expected background count
+
+        # Loss: enforce that each head's expected count is 1 and background count is 0.
+        loss = torch.mean(torch.abs(1 - E_fg)) + torch.abs(E_bg)
+        return loss
+
+
 #############################################
 # Training & Evaluation Setup
 #############################################
@@ -289,7 +442,7 @@ if __name__ == '__main__':
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
     num_epochs = 300
     saved_checkpoints = []
-    checkpoint_files = glob.glob("CACVIT_*.pth")
+    checkpoint_files = glob.glob("CACVITwithBL_*.pth")
 
     if checkpoint_files:
         def get_epoch_from_filename(filename):
@@ -307,91 +460,48 @@ if __name__ == '__main__':
         start_epoch = 1
         print("No checkpoint found. Starting training from scratch.")
     print("Starting training...")
+
+    # Initialize Bayesian loss modules:
+    # Post_Prob: use c_size=384, stride=1, sigma=8.0, background_ratio=0.15, use_background=True.
+    post_prob = Post_Prob(sigma=8.0, c_size=384, stride=1, background_ratio=0.15, use_background=True, device=device)
+    bay_loss = Bay_Loss(use_background=True, device=device)
+
+    # Helper: Build target list (each annotation gets a target of 1)
+    def make_target_list(locations_batch):
+        target_list = []
+        for locs in locations_batch:
+            if len(locs) > 0:
+                target = torch.ones((len(locs),), dtype=torch.float32, device=device)
+            else:
+                target = torch.zeros((1,), dtype=torch.float32, device=device)
+            target_list.append(target)
+        return target_list
+
+    start_epoch = 1
     for epoch in range(start_epoch, num_epochs + 1):
         model.train()
         total_loss = 0.0
         for batch_idx, (images, gt_density, exemplars, scales, locations_batch) in enumerate(train_loader):
-            # Move inputs to device
             images = images.to(device)
             exemplars = exemplars.to(device)
-            scales = scales.to(device)  # may not be used if you don't scale
-            gt_density = gt_density.to(device)
-
+            scales = scales.to(device)
+            # Bayesian loss uses annotation coordinates, not the density map GT.
             optimizer.zero_grad()
             inputs = [images, exemplars, scales]
-
-            # Resize ground truth density to the fixed size (384x384)
-            gt_density_resized = F.interpolate(gt_density.unsqueeze(1), size=(384, 384),
-                                               mode='bilinear', align_corners=False).squeeze(1)
-
-            # Forward pass: predicted density map of shape (B, 384, 384)
-            pred_density = model(inputs)
-
-            # Set up grid for the fixed image size.
-            H, W = 384, 384
-            # Create coordinate tensors for the grid.
-            xs = torch.arange(0, W, device=device).float()
-            ys = torch.arange(0, H, device=device).float()
-            # Use meshgrid (with explicit indexing) so that grid_y and grid_x have shape (H, W)
-            grid_y, grid_x = torch.meshgrid(ys, xs, indexing='ij')
-            # Expand dims so that we can easily subtract point coordinates later.
-            # These grids will have shape (1, H, W)
-            grid_x = grid_x.unsqueeze(0)
-            grid_y = grid_y.unsqueeze(0)
-
-            sigma = 8.0  # Gaussian sigma (adjust as needed)
-            batch_loss = 0.0
-            B = pred_density.shape[0]
-
-            # Loop over each image in the batch
-            for i in range(B):
-                D_pred = pred_density[i]  # shape: (384, 384)
-                # print(locations_batch[i])
-                pts = torch.tensor(locations_batch[i], dtype=torch.float32, device=device)
-                # If no annotations are available, we want the network to predict zero count.
-                if pts.shape[0] == 0:
-                    loss_i = torch.abs(torch.sum(D_pred) - 0.0)
-                else:
-                    kernels = []
-                    # For each annotation, compute a Gaussian over the entire grid.
-                    for j in range(pts.shape[0]):
-                        x0, y0 = pts[j]  # scalars
-                        # Compute squared distance from this point to all grid locations.
-                        dist_sq = (grid_x - x0) ** 2 + (grid_y - y0) ** 2  # shape: (1, H, W)
-                        # Compute the Gaussian kernel (unnormalized probability)
-                        gauss = torch.exp(-dist_sq / (2 * sigma ** 2))  # shape: (1, H, W)
-                        kernels.append(gauss)
-
-                    # Stack kernels so that shape becomes (N, H, W)
-                    kernels = torch.cat(kernels, dim=0)
-                    # Flatten spatial dimensions: (N, H*W)
-                    kernels_flat = kernels.view(pts.shape[0], -1)
-                    # For each pixel (over the H*W dimension), compute a softmax across annotations.
-                    # This gives a probability p(y_n|x_m) for each annotation.
-                    prob = torch.softmax(kernels_flat, dim=0)  # shape: (N, H*W)
-
-                    # Flatten the predicted density map for the image.
-                    D_pred_flat = D_pred.view(-1)  # shape: (H*W)
-                    # Compute the expected count for each annotation:
-                    # E[c_n] = sum_{m} p(y_n|x_m) * D_pred(x_m)
-                    expected_counts = torch.sum(prob * D_pred_flat, dim=1)  # shape: (N,)
-                    # The target count for each annotation is 1.
-                    target_counts = torch.ones_like(expected_counts)
-                    # Compute the L1 loss per image over all annotations.
-                    loss_i = torch.sum(torch.abs(target_counts - expected_counts))
-
-                batch_loss += loss_i
-
-            # Average the loss over the batch
-            bayesian_loss = batch_loss / B
-
-            # Backpropagation and optimizer step
-            bayesian_loss.backward()
+            pred_density = model(inputs)  # (B, 384, 384)
+            st_sizes = [384 for _ in range(images.size(0))]
+            # Convert each list of annotation coordinates to a tensor.
+            points = [torch.tensor(locs, dtype=torch.float32, device=device) if len(locs) > 0
+                      else torch.empty((0, 2), device=device) for locs in locations_batch]
+            prob_list = post_prob(points, st_sizes)
+            target_list = make_target_list(locations_batch)
+            loss_value = bay_loss(prob_list, target_list, pred_density)
+            loss_value.backward()
             optimizer.step()
 
-            total_loss += bayesian_loss.item()
+            total_loss += loss_value.item()
             if (batch_idx + 1) % 10 == 0:
-                print(f"Epoch [{epoch}/{num_epochs}] Batch [{batch_idx+1}/{len(train_loader)}] Loss: {bayesian_loss.item():.6f}")
+                print(f"Epoch [{epoch}/{num_epochs}] Batch [{batch_idx+1}/{len(train_loader)}] Loss: {loss_value.item():.6f}")
         avg_loss = total_loss / len(train_loader)
         print(f"Epoch [{epoch}/{num_epochs}] Average Loss: {avg_loss:.6f}")
 
@@ -437,14 +547,14 @@ if __name__ == '__main__':
             plt.axis('off')
             plt.suptitle(f"Epoch {epoch+1} Evaluation", fontsize=16)
             plt.tight_layout()
-            plt.savefig("CACVIT_VIS.png")
+            plt.savefig("CACVITwithBL_VIS.png")
 
         checkpoint_data = {
             'epoch': epoch,
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
         }
-        checkpoint_filename = f"CACVIT_{epoch}.pth"
+        checkpoint_filename = f"CACVITwithBL_{epoch}.pth"
         torch.save(checkpoint_data, checkpoint_filename)
         print(f"Saved checkpoint: {checkpoint_filename}")
         saved_checkpoints.append(checkpoint_filename)

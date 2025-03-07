@@ -1,43 +1,17 @@
+from functools import partial
+
 import numpy as np
 import torch
 from PIL.Image import Image
+from torch import nn
 from torch.utils.data import Dataset, DataLoader
 import torchvision.transforms as transforms
 import matplotlib.pyplot as plt
-from YCV import CrowdCountingDataset, transform, exemplar_transform, CACViT, custom_collate_fn
+from beiyong2 import CrowdCountingDataset, transform, exemplar_transform, CACViT, custom_collate_fn
 from ultralytics import YOLO
+from YCV import CACVIT
 
 
-#############################################
-# YOLO-Based Exemplars Extraction
-#############################################
-def get_exemplars_from_yolo(pil_image, yolo_model, exemplar_transform, conf_threshold=0.5, num_exemplars=3):
-    """
-    Runs YOLO on the input PIL image to obtain bounding boxes with confidence >= conf_threshold.
-    Crops and resizes the regions to 64x64 and applies exemplar_transform.
-    """
-    results = yolo_model(pil_image)
-    # Assuming results[0].boxes.data is a tensor of shape (N, 6): [x1, y1, x2, y2, conf, cls]
-    boxes = results[0].boxes.data.cpu().numpy()
-    exemplars = []
-    for box in boxes:
-        if box[4] >= conf_threshold:
-            x1, y1, x2, y2 = box[:4]
-            x1, y1, x2, y2 = map(int, [x1, y1, x2, y2])
-            cropped = pil_image.crop((x1, y1, x2, y2))
-            cropped = cropped.resize((64, 64))
-            exemplars.append(cropped)
-            if len(exemplars) >= num_exemplars:
-                break
-    if len(exemplars) < num_exemplars:
-        if len(exemplars) == 0:
-            dummy_ex = Image.fromarray(np.zeros((64,64,3), dtype=np.uint8))
-            exemplars = [dummy_ex] * num_exemplars
-        else:
-            while len(exemplars) < num_exemplars:
-                exemplars.append(exemplars[-1])
-    exemplars = torch.stack([exemplar_transform(ex) for ex in exemplars])
-    return exemplars
 #############################################
 # Evaluation Code (MAE and MAPE metrics)
 #############################################
@@ -45,8 +19,8 @@ if __name__ == '__main__':
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     # Paths (update these paths as necessary)
-    test_img_dir = 'datasets/partA/test_data/images'
-    test_gt_dir = 'datasets/partA/test_data/ground_truth'
+    test_img_dir = 'datasets/partB/test_data/images'
+    test_gt_dir = 'datasets/partB/test_data/ground_truth'
     exemplars_dir = 'datasets/partA/examplars'
 
     test_dataset = CrowdCountingDataset(
@@ -56,13 +30,14 @@ if __name__ == '__main__':
     test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=2, collate_fn=custom_collate_fn)
 
     # Initialize model and load weights
-    model = CACViT(num_exemplars=3, img_size=384, patch_size=16, embed_dim=768).to(device)
-    checkpoint = torch.load("cacvit_crowd_counting.pth", map_location=device)
-    model.load_state_dict(checkpoint)
+    # model = CACViT(num_exemplars=3, img_size=384, patch_size=16, embed_dim=768).to(device)
+    model = CACVIT(patch_size=16, embed_dim=768, depth=12, num_heads=12,
+                   decoder_embed_dim=512, decoder_depth=3, decoder_num_heads=16,
+                   mlp_ratio=4, norm_layer=partial(nn.LayerNorm, eps=1e-6))
+    model = model.to(device)
+    checkpoint = torch.load("YCV5.pth", map_location=device)
+    model.load_state_dict(checkpoint['model_state_dict'])
     model.eval()
-
-    # Load YOLO model
-    yolo_model = YOLO("best.pt")
 
     total_mae = 0.0
     total_mape = 0.0
@@ -71,9 +46,7 @@ if __name__ == '__main__':
 
     with torch.no_grad():
         for sample in test_loader:
-            # sample is a tuple: (image, gt_density, dummy_exemplars, scales, gt_count)
-            image, gt_density, _, scales, gt_counts = sample
-            # Un-normalize to get a PIL image for YOLO inference
+            image, gt_density, exemplars, scales, gt_counts = sample
             inv_normalize = transforms.Normalize(
                 mean=[-0.485 / 0.229, -0.456 / 0.224, -0.406 / 0.225],
                 std=[1 / 0.229, 1 / 0.224, 1 / 0.225]
@@ -83,15 +56,11 @@ if __name__ == '__main__':
             disp_img = torch.clamp(disp_img, 0, 1)
             pil_image = transforms.ToPILImage()(disp_img)
 
-            # Extract exemplars from YOLO
-            exemplars = get_exemplars_from_yolo(pil_image, yolo_model, exemplar_transform, conf_threshold=0.5,
-                                                num_exemplars=3)
-
             image = image.to(device)
             scales = scales.to(device)
             exemplars = exemplars.to(device)
             output_density = model([image, exemplars, scales])  # (1, 384, 384)
-            pred_count = output_density.sum().item()
+            pred_count = output_density.sum().item()/60
             gt_count = float(gt_counts[0])
             total_mae += abs(pred_count - gt_count)
             total_mape += abs(pred_count - gt_count) / (gt_count + epsilon)
@@ -112,7 +81,7 @@ if __name__ == '__main__':
         output_density = model([test_img, test_exemplars, test_scales])
         output_density_np = output_density.squeeze(0).cpu().numpy()
         gt_density_np = test_gt_density.squeeze(0).cpu().numpy()
-        pred_count = output_density_np.sum()
+        pred_count = output_density_np.sum()/60
         gt_count = float(gt_counts[0])
 
         # Convert normalized image back to PIL image for display (reverse normalization)

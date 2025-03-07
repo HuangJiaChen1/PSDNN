@@ -95,7 +95,7 @@ class CrowdCountingDataset(Dataset):
             image = self.transform(image)  # (C, H, W)
         if self.exemplar_transform:
             exemplars = torch.stack([self.exemplar_transform(ex) for ex in exemplars])  # (num_exemplars, C, H, W)
-        density_map = torch.from_numpy(density_map).float()  # (H, W)
+        density_map = torch.from_numpy(density_map).float()*60  # (H, W)
 
         return image, density_map, exemplars, scales, len(locations)
 
@@ -357,11 +357,11 @@ if __name__ == '__main__':
     model = CACViT(num_exemplars=3, img_size=384, patch_size=16, embed_dim=768).to(device)
 
     # Dataset paths (adjust these paths as necessary)
-    train_img_dir = 'datasets/partA/train_data/images'
-    train_gt_dir = 'datasets/partA/train_data/ground_truth'
+    train_img_dir = 'datasets/partB/train_data/images'
+    train_gt_dir = 'datasets/partB/train_data/ground_truth'
     exemplars_dir = 'datasets/partA/examplars'  # Ensure exemplars exist here
-    test_img_dir = 'datasets/partA/test_data/images'
-    test_gt_dir = 'datasets/partA/test_data/ground_truth'
+    test_img_dir = 'datasets/partB/test_data/images'
+    test_gt_dir = 'datasets/partB/test_data/ground_truth'
 
     # Create DataLoaders for training and evaluation
     train_dataset = CrowdCountingDataset(
@@ -429,12 +429,13 @@ if __name__ == '__main__':
             # Resize ground truth density map if needed
             gt_density_resized = F.interpolate(gt_density.unsqueeze(1), size=(384, 384), mode='bilinear',
                                                align_corners=False).squeeze(1)
-            pred_count = pred_density.cpu().detach().numpy().sum()
-            mae_loss = abs(gt_count - pred_count)
+            pred_count = pred_density.cpu().detach().numpy().sum()/60
+            mape_loss = abs(gt_count - pred_count)/gt_count
 
             loss = (pred_density - gt_density_resized) ** 2
             loss = loss.mean()  # Ensure loss is a scalar if needed
-            # loss += 0.00001 * mae_loss
+            loss += 0.1 * mape_loss
+            # loss = criterion(pred_density, gt_density_resized)
 
             loss.backward()
             optimizer.step()
@@ -458,7 +459,7 @@ if __name__ == '__main__':
             saved_checkpoints.append(checkpoint_filename)
 
             # If more than 3 checkpoints exist, delete the oldest one
-            if len(saved_checkpoints) > 3:
+            if len(saved_checkpoints) > 1:
                 oldest_checkpoint = saved_checkpoints.pop(0)
                 if os.path.exists(oldest_checkpoint):
                     os.remove(oldest_checkpoint)
@@ -477,7 +478,7 @@ if __name__ == '__main__':
                 output_density_np = output_density.squeeze(0).cpu().numpy()
                 gt_density_np = test_gt_density.squeeze(0).cpu().numpy()
 
-                pred_count = output_density_np.sum()
+                pred_count = output_density_np.sum()/60
                 gt_density_resized = F.interpolate(test_gt_density.unsqueeze(1), size=(384, 384), mode='bilinear',
                                                    align_corners=False).squeeze(1)
                 loss = criterion(gt_density_resized, output_density)
