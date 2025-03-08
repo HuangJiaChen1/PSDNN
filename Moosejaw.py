@@ -160,7 +160,7 @@ def main():
                    mlp_ratio=4, norm_layer=partial(nn.LayerNorm, eps=1e-6))
 
     # Load model weights
-    checkpoint = torch.load("YCV5.pth")
+    checkpoint = torch.load("YCV300.pth")
     model.load_state_dict(checkpoint['model_state_dict'])
     model = model.to(device)
     model.eval()

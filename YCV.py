@@ -11,17 +11,56 @@ from torch.utils.data import Dataset, DataLoader
 from mat4py import loadmat
 import torchvision.transforms as transforms
 import matplotlib.pyplot as plt
-from einops import rearrange,repeat
+from einops import rearrange, repeat
 from timm.models.vision_transformer import PatchEmbed
 from Blocks import Block
 from pos_embed import get_2d_sincos_pos_embed
+from geomloss import SamplesLoss
+
 
 #############################################
 # Dataset Definition
 #############################################
+
+
+class CrowdCountingLoss(nn.Module):
+    def __init__(self, alpha=1, sinkhorn_blur=0.2, density_scale=10):  # Increased blur
+        super().__init__()
+        self.alpha = alpha
+        self.density_scale = density_scale
+        self.sinkhorn = SamplesLoss(
+            loss="sinkhorn",
+            p=2,
+            backend="multiscale",
+            blur=sinkhorn_blur,
+            scaling=0.9,
+            reach=0.1
+        )
+
+    def forward(self, pred_map, gt_map, gt_blur_map):
+        # Add density map reconstruction loss
+        density_loss = F.mse_loss(pred_map, gt_blur_map)
+
+        # Scale counts appropriately
+        pred_count = pred_map.sum(dim=[1, 2, 3])/360
+        gt_count = gt_map.sum(dim=[1, 2, 3])/360
+
+        count_loss = F.l1_loss(pred_count, gt_count)
+
+        pred_map = pred_map.squeeze(1)
+        gt_map = gt_map.squeeze(1)
+
+        density_loss = F.mse_loss(pred_map, gt_map)
+        spatial_loss = torch.mean(self.sinkhorn(pred_map, gt_map))
+
+        return density_loss + count_loss + self.alpha * spatial_loss
+
+#############################################
+# Modified Training Dataset
+#############################################
 class CrowdCountingDataset(Dataset):
-    def __init__(self, img_dir, gt_dir, exemplars_dir, transform=None, exemplar_transform=None, num_exemplars=3,
-                 resize_shape=(384, 384)):
+    def __init__(self, img_dir, gt_dir, exemplars_dir, transform=None, exemplar_transform=None,
+                 num_exemplars=3, resize_shape=(1152, 768), crop_size=(384, 384)):
         """
         Args:
             img_dir: Directory with input images.
@@ -30,7 +69,8 @@ class CrowdCountingDataset(Dataset):
             transform: Transform for the query images.
             exemplar_transform: Transform for the exemplar images.
             num_exemplars: Number of exemplars to use.
-            resize_shape: Target size for query images.
+            resize_shape: Size to which the original image is resized (width, height), e.g. (1152,768).
+            crop_size: Size of each crop, e.g. (384,384).
         """
         self.img_dir = img_dir
         self.gt_dir = gt_dir
@@ -38,39 +78,77 @@ class CrowdCountingDataset(Dataset):
         self.transform = transform
         self.exemplar_transform = exemplar_transform
         self.num_exemplars = num_exemplars
-        self.resize_shape = resize_shape
+        self.resize_shape = resize_shape  # (width, height)
+        self.crop_size = crop_size        # (crop_width, crop_height)
+
         self.img_names = [f for f in os.listdir(img_dir) if f.endswith('.jpg')]
 
+        # Build an index mapping: each image yields multiple crops.
+        # For a resized image of size (1152,768) and crop (384,384):
+        # Number of columns = 1152 // 384 = 3, rows = 768 // 384 = 2, total = 6 crops.
+        self.cols = self.resize_shape[0] // self.crop_size[0]
+        self.rows = self.resize_shape[1] // self.crop_size[1]
+        self.samples_per_image = self.rows * self.cols
+
+        # Build a list of (img_index, crop_row, crop_col)
+        self.index_map = []
+        for i in range(len(self.img_names)):
+            for r in range(self.rows):
+                for c in range(self.cols):
+                    self.index_map.append((i, r, c))
+
     def __len__(self):
-        return len(self.img_names)
+        return len(self.index_map)
 
     def __getitem__(self, idx):
-        # Load image
-        img_name = self.img_names[idx]
+        # Get mapping: which image and which crop.
+        img_idx, crop_r, crop_c = self.index_map[idx]
+        img_name = self.img_names[img_idx]
         img_path = os.path.join(self.img_dir, img_name)
         image = Image.open(img_path).convert('RGB')
-        img_width, img_height = image.size
+        orig_w, orig_h = image.size
 
-        # Load ground truth
+        # Resize image to fixed size (1152,768)
+        new_w, new_h = self.resize_shape
+        image_resized = image.resize((new_w, new_h), Image.BILINEAR)
+
+        # Compute scaling factors for annotations
+        scale_x = new_w / orig_w
+        scale_y = new_h / orig_h
+
+        # Load ground truth annotations and scale them.
         gt_name = 'GT_' + img_name.replace('.jpg', '.mat')
         gt_path = os.path.join(self.gt_dir, gt_name)
         mat = loadmat(gt_path)
         locations = mat['image_info']['location']
-        locations = [(float(p[0]), float(p[1])) for p in locations]
+        # Scale annotations to the resized image
+        scaled_locations = [(float(p[0]) * scale_x, float(p[1]) * scale_y) for p in locations]
 
-        # Generate density map (scale head locations to match resized image)
-        scale_x = self.resize_shape[1] / img_width
-        scale_y = self.resize_shape[0] / img_height
-        scaled_locations = [(p[0] * scale_x, p[1] * scale_y) for p in locations]
-        density_map = self.generate_density_map(self.resize_shape, scaled_locations)
+        # Compute full density map for the resized image (optional: you could generate a density map per crop instead)
+        full_density = self.generate_density_map((new_h, new_w), scaled_locations)
+        full_density = full_density.astype(np.float32)  # as before
 
-        # Load exemplars based on a naming pattern (adjust this as needed)
+        # Crop the image: crop_size (384,384)
+        crop_w, crop_h = self.crop_size
+        left = crop_c * crop_w
+        top = crop_r * crop_h
+        image_crop = image_resized.crop((left, top, left + crop_w, top + crop_h))
+        # Crop density map accordingly
+        density_crop = full_density[top:top+crop_h, left:left+crop_w]
+
+        # Adjust annotation coordinates to the crop:
+        # Keep only points within the crop, and subtract the crop offset.
+        crop_points = []
+        for (x, y) in scaled_locations:
+            if left <= x < left+crop_w and top <= y < top+crop_h:
+                crop_points.append((x - left, y - top))
+        # Optionally, if no points fall inside, you can still return an empty list.
+        # For Bayesian loss, an empty list might be handled specially.
+
+        # Load exemplars (they remain unchanged)
         exemplar_prefix = 'EXAMPLARS_' + img_name.split('_')[1].split('.')[0] + '_'
-        exemplar_paths = [
-            os.path.join(self.exemplars_dir, f)
-            for f in os.listdir(self.exemplars_dir)
-            if f.startswith(exemplar_prefix)
-        ]
+        exemplar_paths = [os.path.join(self.exemplars_dir, f) for f in os.listdir(self.exemplars_dir)
+                          if f.startswith(exemplar_prefix)]
         exemplars = []
         for p in exemplar_paths[:self.num_exemplars]:
             try:
@@ -78,29 +156,26 @@ class CrowdCountingDataset(Dataset):
                 exemplars.append(ex)
             except Exception as e:
                 print(f"Error loading exemplar {p}: {e}")
-
-        # If missing exemplars, fill in
         if len(exemplars) < self.num_exemplars:
             if len(exemplars) == 0:
                 dummy_ex = Image.fromarray(np.zeros((64, 64, 3), dtype=np.uint8))
                 exemplars = [dummy_ex] * self.num_exemplars
             else:
-                exemplars = exemplars * (self.num_exemplars // len(exemplars)) + exemplars[
-                                                                                 :self.num_exemplars % len(exemplars)]
+                exemplars = exemplars * (self.num_exemplars // len(exemplars)) + exemplars[:self.num_exemplars % len(exemplars)]
         elif len(exemplars) > self.num_exemplars:
             exemplars = exemplars[:self.num_exemplars]
 
-        # Scales (assuming exemplar size is 64x64)
-        scales = torch.ones((self.num_exemplars, 2), dtype=torch.float32) * (64 / max(img_width, img_height))
+        # Scales for exemplars (using the resized image size)
+        scales = torch.ones((self.num_exemplars, 2), dtype=torch.float32) * (64 / max(new_w, new_h))
 
         # Apply transforms
         if self.transform:
-            image = self.transform(image)  # (C, H, W)
+            image_crop = self.transform(image_crop)  # (C, 384, 384)
         if self.exemplar_transform:
-            exemplars = torch.stack([self.exemplar_transform(ex) for ex in exemplars])  # (num_exemplars, C, H, W)
-        density_map = torch.from_numpy(density_map).float()*60  # (H, W)
+            exemplars = torch.stack([self.exemplar_transform(ex) for ex in exemplars])
+        density_crop = torch.from_numpy(density_crop).float()*360
 
-        return image, density_map, exemplars, scales, len(locations)
+        return image_crop, density_crop, exemplars, scales, len(crop_points)
 
     def generate_density_map(self, img_shape, points, sigma=2):
         density_map = np.zeros(img_shape, dtype=np.float32)
@@ -129,6 +204,9 @@ def gaussian_kernel(kernel_size=15, sigma=4):
     xx, yy = np.meshgrid(ax, ax)
     kernel = np.exp(-(xx ** 2 + yy ** 2) / (2. * sigma ** 2))
     return kernel / np.sum(kernel)
+
+
+
 #############################################
 # Transforms
 #############################################
@@ -425,6 +503,44 @@ def custom_collate_fn(batch):
     return images, density_maps, exemplars, scales, gt_counts
 
 
+def sliding_window_inference(model, image, exemplars, scales, window_size=(384, 384), stride=128, device='cpu'):
+    """
+    Args:
+        model: Trained model.
+        image: Full image as a tensor of shape (C,H,W) (assumed to be normalized as in training).
+        exemplars: Exemplar images tensor.
+        scales: Scale info tensor.
+        window_size: Tuple (width, height).
+        stride: Sliding stride.
+        device: device to run inference.
+    Returns:
+        Combined density map for the entire image.
+    """
+    model.eval()
+    C, H, W = image.shape
+    w_win, h_win = window_size
+    # Create an empty accumulation tensor and a counter tensor for averaging overlaps.
+    density_sum = torch.zeros((H, W), device=device)
+    count_map = torch.zeros((H, W), device=device)
+
+    # Slide over the image
+    for top in range(0, H - h_win + 1, stride):
+        for left in range(0, W - w_win + 1, stride):
+            crop = image[:, top:top + h_win, left:left + w_win].unsqueeze(0)  # (1,C,h_win,w_win)
+            # Run model on the crop. Make sure exemplars and scales are on device.
+            with torch.no_grad():
+                pred_density = model([crop.to(device), exemplars.to(device), scales.to(device)])
+                # pred_density is (1, h_win, w_win)
+            pred_density = pred_density.squeeze(0)
+            # Accumulate predictions (for overlapping regions, add the predictions)
+            density_sum[top:top + h_win, left:left + w_win] += pred_density
+            count_map[top:top + h_win, left:left + w_win] += 1
+
+    # Avoid division by zero
+    count_map[count_map == 0] = 1
+    combined_density = density_sum / count_map
+    return combined_density.cpu()
+
 
 #############################################
 # Training & Evaluation Setup
@@ -448,13 +564,15 @@ if __name__ == '__main__':
     # Create DataLoaders for training and evaluation
     train_dataset = CrowdCountingDataset(
         train_img_dir, train_gt_dir, exemplars_dir,
-        transform=transform, exemplar_transform=exemplar_transform, num_exemplars=3, resize_shape=(384, 384)
+        transform=transform, exemplar_transform=exemplar_transform,
+        num_exemplars=3, resize_shape=(1152, 768), crop_size=(384, 384)
     )
     train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True, num_workers=2, collate_fn=custom_collate_fn)
 
     test_dataset = CrowdCountingDataset(
         test_img_dir, test_gt_dir, exemplars_dir,
-        transform=transform, exemplar_transform=exemplar_transform, num_exemplars=3, resize_shape=(384, 384)
+        transform=transform, exemplar_transform=exemplar_transform,
+        num_exemplars=3, resize_shape=(1152, 768), crop_size=(384, 384)
     )
     test_loader = DataLoader(test_dataset, batch_size=1, shuffle=True, num_workers=0, collate_fn=custom_collate_fn)
 
@@ -507,7 +625,7 @@ if __name__ == '__main__':
             # Resize ground truth density map if needed
             gt_density_resized = F.interpolate(gt_density.unsqueeze(1), size=(384, 384), mode='bilinear',
                                                align_corners=False).squeeze(1)
-            pred_count = pred_density.cpu().detach().numpy().sum()/60
+            pred_count = pred_density.cpu().detach().numpy().sum()/360
 
             loss = (pred_density - gt_density_resized) ** 2
             loss = loss.mean()
@@ -558,7 +676,7 @@ if __name__ == '__main__':
                 output_density_np = output_density.squeeze(0).cpu().numpy()
                 gt_density_np = test_gt_density.squeeze(0).cpu().numpy()
 
-                pred_count = output_density_np.sum()/60
+                pred_count = output_density_np.sum()/360
                 gt_density_resized = F.interpolate(test_gt_density.unsqueeze(1), size=(384, 384), mode='bilinear',
                                                    align_corners=False).squeeze(1)
                 loss = criterion(gt_density_resized, output_density)
