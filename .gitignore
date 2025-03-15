@@ -3,5 +3,7 @@
 vit_ebc_shtechA.pth
 /datasets/partA/examplars
 *.pth
+NWPU_60
 /__pycache__
 __pycache__/CACViT.cpython-38.pyc
+
