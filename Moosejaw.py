@@ -31,7 +31,7 @@ def process_video(video_path, output_path, model, device, transform, exemplar_tr
     # Create a VideoWriter object to save the output
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
-    exemplar_dir = "datasets/partA/examplars"  # Change to your exemplars directory
+    exemplar_dir = "NWPU_60/examplars"  # Change to your exemplars directory
 
     # Load exemplars (you'll need to replace this with your actual exemplars)
     exemplars = load_exemplars(exemplar_dir, num_exemplars=3, transform=exemplar_transform)
@@ -62,7 +62,7 @@ def process_video(video_path, output_path, model, device, transform, exemplar_tr
             pred_density = model(inputs)
 
             # Calculate count from density map
-            pred_count = int(round(pred_density.sum().item() / 60))
+            pred_count = int(round(pred_density.sum().item() / 360))
 
             # Convert density map to heatmap for visualization
             density_map = pred_density.squeeze(0).cpu().numpy()
@@ -160,7 +160,7 @@ def main():
                    mlp_ratio=4, norm_layer=partial(nn.LayerNorm, eps=1e-6))
 
     # Load model weights
-    checkpoint = torch.load("YCV300.pth")
+    checkpoint = torch.load("YCV142.pth")
     model.load_state_dict(checkpoint['model_state_dict'])
     model = model.to(device)
     model.eval()
@@ -168,7 +168,7 @@ def main():
     # Define input and output paths
     video_path = "10 to 20 people.MOV"  # Change this to your input video path
     output_path = "output_crowd_counting.mp4"
-    exemplar_dir = "datasets/partA/examplars"  # Change to your exemplars directory
+    exemplar_dir = "NWPU_60/examplars"  # Change to your exemplars directory
 
     # Process the video
     process_video(video_path, output_path, model, device, transform, exemplar_transform)

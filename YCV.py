@@ -16,7 +16,7 @@ from timm.models.vision_transformer import PatchEmbed
 from Blocks import Block
 from pos_embed import get_2d_sincos_pos_embed
 from geomloss import SamplesLoss
-
+import torch.nn.functional as F
 
 #############################################
 # Dataset Definition
@@ -122,7 +122,14 @@ class CrowdCountingDataset(Dataset):
         mat = loadmat(gt_path)
         locations = mat['image_info']['location']
         # Scale annotations to the resized image
-        scaled_locations = [(float(p[0]) * scale_x, float(p[1]) * scale_y) for p in locations]
+        try:
+            scaled_locations = [(float(p[0]) * scale_x, float(p[1]) * scale_y) for p in locations]
+        except Exception as e:
+            print(e)
+            print(locations)
+            print(img_path)
+            print(gt_path)
+
 
         # Compute full density map for the resized image (optional: you could generate a density map per crop instead)
         full_density = self.generate_density_map((new_h, new_w), scaled_locations)
@@ -175,7 +182,7 @@ class CrowdCountingDataset(Dataset):
             exemplars = torch.stack([self.exemplar_transform(ex) for ex in exemplars])
         density_crop = torch.from_numpy(density_crop).float()*360
 
-        return image_crop, density_crop, exemplars, scales, len(crop_points)
+        return image_crop, density_crop, exemplars, scales, len(crop_points), scaled_locations
 
     def generate_density_map(self, img_shape, points, sigma=2):
         density_map = np.zeros(img_shape, dtype=np.float32)
@@ -500,7 +507,8 @@ def custom_collate_fn(batch):
     exemplars = torch.stack([item[2] for item in batch])
     scales = torch.stack([item[3] for item in batch])
     gt_counts = [item[4] for item in batch]  # This returns a list of counts
-    return images, density_maps, exemplars, scales, gt_counts
+    scaled_locations = [item[5] for item in batch]
+    return images, density_maps, exemplars, scales, gt_counts, scaled_locations
 
 
 def sliding_window_inference(model, image, exemplars, scales, window_size=(384, 384), stride=128, device='cpu'):
@@ -543,6 +551,73 @@ def sliding_window_inference(model, image, exemplars, scales, window_size=(384, 
 
 
 #############################################
+# Loss
+#############################################
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class CrowdCountingLoss(nn.Module):
+    def __init__(self, alpha=0.0036, beta=0.0000008, sinkhorn_blur=0.2, density_scale=10, epsilon=0.01, sinkhorn_iters=20):
+        super().__init__()
+        self.alpha = alpha
+        self.beta = beta
+        self.density_scale = density_scale
+        self.epsilon = epsilon  # Entropic regularization for Sinkhorn
+        self.sinkhorn_iters = sinkhorn_iters  # Number of Sinkhorn iterations
+
+    def sinkhorn_loss(self, pred_map, gt_map):
+        """ Computes the Sinkhorn loss between predicted and ground-truth density maps """
+        # Flatten maps
+        a = pred_map.view(-1) + 1e-8  # Avoid zero division
+        b = gt_map.view(-1) + 1e-8
+
+        # Compute cost matrix (Squared Euclidean distance)
+        coords_pred = torch.nonzero(pred_map, as_tuple=False).float()
+        coords_gt = torch.nonzero(gt_map, as_tuple=False).float()
+
+        if coords_pred.shape[0] == 0 or coords_gt.shape[0] == 0:
+            return torch.tensor(0.0, device=pred_map.device)  # Return zero if no valid density
+
+        num_pred, num_gt = coords_pred.shape[0], coords_gt.shape[0]
+
+        cost_matrix = torch.cdist(coords_pred, coords_gt).pow(2)  # Shape: [num_pred, num_gt]
+
+        # Initialize Sinkhorn dual potentials with correct shapes
+        u = torch.zeros(num_pred, device=pred_map.device)  # Shape: [num_pred]
+        v = torch.zeros(num_gt, device=pred_map.device)  # Shape: [num_gt]
+
+        # Sinkhorn iterations
+        for _ in range(self.sinkhorn_iters):
+            u = -self.epsilon * torch.logsumexp((v[None, :] - cost_matrix) / self.epsilon, dim=1)  # Fix: dim=1
+            v = -self.epsilon * torch.logsumexp((u[:, None] - cost_matrix) / self.epsilon, dim=0)  # Fix: dim=0
+
+        # Compute transport cost
+        transport_cost = torch.sum(torch.exp((u[:, None] + v[None, :] - cost_matrix) / self.epsilon) * cost_matrix)
+        return transport_cost
+
+
+    def forward(self, pred_map, gt_map, gt_blur_map, pred_count, gt_count):
+        pred_count = torch.tensor(pred_count, dtype=torch.float32, device=pred_map.device).view(1)
+        gt_count = torch.tensor(gt_count, dtype=torch.float32, device=pred_map.device).view(1)
+        gt_map = torch.tensor(gt_map, dtype=torch.float32, device=pred_map.device)
+
+        # Density map reconstruction loss
+        density_loss = F.mse_loss(pred_map, gt_blur_map)
+
+        # Count loss
+        count_loss = F.l1_loss(pred_count, gt_count)
+
+        # Compute Sinkhorn loss
+        sinkhorn_loss = self.sinkhorn_loss(pred_map, gt_map)
+
+        # Final loss
+        return self.beta*(density_loss + count_loss + self.alpha * sinkhorn_loss)
+
+
+
+#############################################
 # Training & Evaluation Setup
 #############################################
 if __name__ == '__main__':
@@ -555,30 +630,33 @@ if __name__ == '__main__':
         mlp_ratio=4, norm_layer=partial(nn.LayerNorm, eps=1e-6))
     model = model.to(device)
     # Dataset paths (adjust these paths as necessary)
-    train_img_dir = 'datasets/partB/train_data/images'
-    train_gt_dir = 'datasets/partB/train_data/ground_truth'
-    exemplars_dir = 'datasets/partA/examplars'  # Ensure exemplars exist here
-    test_img_dir = 'datasets/partB/test_data/images'
-    test_gt_dir = 'datasets/partB/test_data/ground_truth'
+    train_img_dir = 'NWPU_60/img'
+    train_gt_dir = 'NWPU_60/mat'
+    exemplars_dir = 'NWPU_60/examplars'  # Ensure exemplars exist here
+    test_img_dir = 'NWPU_60/val_img'
+    test_gt_dir = 'NWPU_60/val_mat'
 
     # Create DataLoaders for training and evaluation
     train_dataset = CrowdCountingDataset(
         train_img_dir, train_gt_dir, exemplars_dir,
         transform=transform, exemplar_transform=exemplar_transform,
-        num_exemplars=3, resize_shape=(1152, 768), crop_size=(384, 384)
+        num_exemplars=3, resize_shape=(576, 384), crop_size=(576, 384)
     )
-    train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True, num_workers=2, collate_fn=custom_collate_fn)
+    train_loader = DataLoader(train_dataset, batch_size=1, shuffle=True, num_workers=2, collate_fn=custom_collate_fn)
 
     test_dataset = CrowdCountingDataset(
         test_img_dir, test_gt_dir, exemplars_dir,
         transform=transform, exemplar_transform=exemplar_transform,
-        num_exemplars=3, resize_shape=(1152, 768), crop_size=(384, 384)
+        num_exemplars=3, resize_shape=(576, 384), crop_size=(576, 384)
     )
     test_loader = DataLoader(test_dataset, batch_size=1, shuffle=True, num_workers=0, collate_fn=custom_collate_fn)
 
     # Optimizer and loss function
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
-    criterion = nn.MSELoss()
+
+    # criterion = nn.MSELoss()
+    criterion = CrowdCountingLoss()
+    # criterion = CombinedLoss(lambda_mse=0.5, lambda_ssim=0.5)
 
     num_epochs = 300
     saved_checkpoints = []
@@ -607,12 +685,14 @@ if __name__ == '__main__':
         start_epoch = 1
         print("No checkpoint found. Starting training from scratch.")
     print("Starting training...")
-    model.load_state_dict(torch.load("best-model.pth")['model'])
+
+    # model.load_state_dict(torch.load("best_model.pth", weights_only = False)['model'])
+
     # optimizer.load_state_dict(torch.load("best_model.pth")[['optimizer']])
     for epoch in range(start_epoch, num_epochs + 1):
         model.train()
         total_loss = 0.0
-        for batch_idx, (images, gt_density, exemplars, scales,gt_count) in enumerate(train_loader):
+        for batch_idx, (images, gt_density, exemplars, scales, gt_count, gt_map) in enumerate(train_loader):
             images = images.to(device)
             gt_density = gt_density.to(device)
             exemplars = exemplars.to(device)
@@ -625,10 +705,14 @@ if __name__ == '__main__':
             # Resize ground truth density map if needed
             gt_density_resized = F.interpolate(gt_density.unsqueeze(1), size=(384, 384), mode='bilinear',
                                                align_corners=False).squeeze(1)
-            pred_count = pred_density.cpu().detach().numpy().sum()/360
+            # pred_count = pred_density.cpu().detach().numpy().sum()/360
+            pred_count = pred_density.sum().item()  # Convert to scalar properly
 
-            loss = (pred_density - gt_density_resized) ** 2
-            loss = loss.mean()
+
+            # loss = (pred_density - gt_density_resized) ** 2
+            # loss = loss.mean()
+            
+            loss = criterion(pred_density,gt_map, gt_density_resized,pred_count, gt_count)
 
             # mape_loss = abs(gt_count - pred_count)/gt_count
             # loss = (pred_density - gt_density_resized) ** 2
@@ -667,7 +751,7 @@ if __name__ == '__main__':
             model.eval()
             with torch.no_grad():
                 sample = next(iter(test_loader))
-                test_img, test_gt_density, test_exemplars, test_scales, gt_count = sample
+                test_img, test_gt_density, test_exemplars, test_scales, gt_count, gt_map = sample
                 test_img = test_img.to(device)
                 test_gt_density = test_gt_density.to(device)
                 test_exemplars = test_exemplars.to(device)
@@ -679,7 +763,11 @@ if __name__ == '__main__':
                 pred_count = output_density_np.sum()/360
                 gt_density_resized = F.interpolate(test_gt_density.unsqueeze(1), size=(384, 384), mode='bilinear',
                                                    align_corners=False).squeeze(1)
-                loss = criterion(gt_density_resized, output_density)
+                # loss = criterion(output_density,gt_map, gt_density_resized,pred_count, gt_count)
+
+                loss = (output_density_np - gt_density_resized) ** 2
+                loss = loss.mean()
+
                 print(f"Eval loss: {loss}")
                 # Convert normalized image back to PIL image for display (reverse normalization)
                 inv_normalize = transforms.Normalize(
@@ -690,28 +778,17 @@ if __name__ == '__main__':
                 disp_img = inv_normalize(disp_img)
                 disp_img = torch.clamp(disp_img, 0, 1)
                 disp_img = transforms.ToPILImage()(disp_img)
-
-                # Plotting
-                plt.figure(figsize=(18, 6))
-                plt.subplot(1, 3, 1)
-                plt.imshow(disp_img)
-                plt.title("Input Image")
-                plt.axis('off')
-
+                
+                fig, ax = plt.subplots(figsize=(8, 8))
+                ax.imshow(disp_img)
+                ax.imshow(output_density_np, cmap='Reds', alpha=0.5)  # Red overlay with transparency
+                
                 if isinstance(gt_count, list):
                     gt_count = float(gt_count[0])
-
-                plt.subplot(1, 3, 2)
-                plt.imshow(gt_density_np, cmap='jet')
-                plt.title(f"GT Density Map\nCount: {gt_count:.2f}")
-                plt.axis('off')
-
-                plt.subplot(1, 3, 3)
-                plt.imshow(output_density_np, cmap='jet')
-                plt.title(f"Predicted Density Map\nCount: {pred_count:.2f}")
-                plt.axis('off')
-
-                plt.suptitle(f"Epoch {epoch + 1} Evaluation", fontsize=16)
+                
+                ax.set_title(f"Predicted Density Map (Overlay)\nCount: {pred_count:.2f}", fontsize=14)
+                ax.axis('off')
+                
                 plt.tight_layout()
                 plt.savefig("YCV_VIS.png")
 
