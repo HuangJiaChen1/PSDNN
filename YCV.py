@@ -705,8 +705,8 @@ if __name__ == '__main__':
             # Resize ground truth density map if needed
             gt_density_resized = F.interpolate(gt_density.unsqueeze(1), size=(384, 384), mode='bilinear',
                                                align_corners=False).squeeze(1)
-            # pred_count = pred_density.cpu().detach().numpy().sum()/360
-            pred_count = pred_density.sum().item()  # Convert to scalar properly
+            pred_count = pred_density.cpu().detach().numpy().sum()/360
+            # pred_count = pred_density.sum().item()/360
 
 
             # loss = (pred_density - gt_density_resized) ** 2
@@ -748,6 +748,18 @@ if __name__ == '__main__':
                     print(f"Deleted old checkpoint: {oldest_checkpoint}")
 
             # --- Evaluation & Visualization on 1 Test Image ---
+            best_loss_file = "best_eval_loss.txt"
+
+            if os.path.exists(best_loss_file):
+                with open(best_loss_file, "r") as f:
+                    try:
+                        best_loss = float(f.read().strip())
+                    except ValueError:
+                        best_loss = float("inf")
+            else:
+                best_loss = float("inf")
+
+
             model.eval()
             with torch.no_grad():
                 sample = next(iter(test_loader))
@@ -760,13 +772,24 @@ if __name__ == '__main__':
                 output_density_np = output_density.squeeze(0).cpu().numpy()
                 gt_density_np = test_gt_density.squeeze(0).cpu().numpy()
 
-                pred_count = output_density_np.sum()/360
+                # pred_count = output_density_np.sum()/360
+                pred_count = pred_density.cpu().detach().numpy().sum()/360
                 gt_density_resized = F.interpolate(test_gt_density.unsqueeze(1), size=(384, 384), mode='bilinear',
                                                    align_corners=False).squeeze(1)
                 # loss = criterion(output_density,gt_map, gt_density_resized,pred_count, gt_count)
 
-                loss = (output_density_np - gt_density_resized) ** 2
+                loss = (output_density_np - gt_density_resized.squeeze(0).cpu().numpy()) ** 2
                 loss = loss.mean()
+
+
+                if loss < best_loss:
+                    best_loss = loss
+                    torch.save(model.state_dict(), "YCV_best.pth")
+                    print(f"New best model saved with loss: {best_loss}")
+
+                    # Update best loss file
+                    with open(best_loss_file, "w") as f:
+                        f.write(f"{best_loss}")
 
                 print(f"Eval loss: {loss}")
                 # Convert normalized image back to PIL image for display (reverse normalization)
@@ -786,7 +809,7 @@ if __name__ == '__main__':
                 if isinstance(gt_count, list):
                     gt_count = float(gt_count[0])
                 
-                ax.set_title(f"Predicted Density Map (Overlay)\nCount: {pred_count:.2f}", fontsize=14)
+                ax.set_title(f"Predicted Density Map \nCount: {pred_count:.2f}", fontsize=14)
                 ax.axis('off')
                 
                 plt.tight_layout()
