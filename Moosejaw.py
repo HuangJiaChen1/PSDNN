@@ -1,178 +1,213 @@
 import cv2
-import torch
+import glob
+import os
+import random
 import numpy as np
-from functools import partial
-import matplotlib.pyplot as plt
+import torch
 import torch.nn as nn
-import torch.nn.functional as F
+from torchvision import transforms as T
 from PIL import Image
-import torchvision.transforms as transforms
-from einops import rearrange, repeat
-from timm.models.vision_transformer import PatchEmbed
+import timm
+from tqdm import tqdm
 
-# Import necessary modules from your existing code
-from Blocks import Block
-from pos_embed import get_2d_sincos_pos_embed
-from YCV import CACVIT  # Assuming your model class is in a file called CACVIT.py
+# Device configuration
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+# Basic transforms
+to_tensor = T.ToTensor()
+normalize = T.Normalize(mean=[0.485, 0.456, 0.406],
+                        std=[0.229, 0.224, 0.225])
 
 
-def process_video(video_path, output_path, model, device, transform, exemplar_transform):
-    # Open the video file
-    cap = cv2.VideoCapture(video_path)
+# -----------------------------------------------------------------------------
+# Helper function: predict_full_image
+# -----------------------------------------------------------------------------
+def predict_full_image(model, image, device):
+    """
+    Splits a full image (448x672) into 6 fixed 224x224 patches,
+    runs each patch through the model, and stitches the 28x28 token outputs
+    into a full prediction.
+
+    Args:
+        model: the trained CrowdCountingSwin model.
+        image: a tensor of shape [3, 448, 672].
+        device: torch device.
+
+    Returns:
+        full_output: tensor of shape [56*84, 5].
+    """
+    patches = []
+    for i in range(2):  # 2 rows
+        for j in range(3):  # 3 columns
+            patch = image[:, i * 224:(i + 1) * 224, j * 224:(j + 1) * 224]
+            patches.append(patch)
+    patch_batch = torch.stack(patches, dim=0).to(device)  # [6, 3, 224, 224]
+    patch_logits = model(patch_batch)  # [6, 784, 5] (each patch gives 28x28 tokens)
+    num_classes = patch_logits.shape[-1]
+    # Reshape each patch's output to [28, 28, num_classes]
+    patch_outputs = patch_logits.reshape(6, 28, 28, num_classes)  # [6, 28, 28, 5]
+    top_row = torch.cat((patch_outputs[0], patch_outputs[1], patch_outputs[2]), dim=1)  # [28, 84, 5]
+    bottom_row = torch.cat((patch_outputs[3], patch_outputs[4], patch_outputs[5]), dim=1)  # [28, 84, 5]
+    full_output = torch.cat((top_row, bottom_row), dim=0)  # [56, 84, 5]
+    full_output = full_output.reshape(-1, num_classes)  # [56*84, 5]
+    return full_output
+
+
+# -----------------------------------------------------------------------------
+# Model Definition (same as before)
+# -----------------------------------------------------------------------------
+class LearnableUpsample(nn.Module):
+    def __init__(self, in_channels):
+        super().__init__()
+        # Upsample from 7x7 to 28x28 using a transposed convolution.
+        self.deconv = nn.ConvTranspose2d(in_channels, in_channels, kernel_size=4, stride=4, padding=0)
+        self.bn = nn.BatchNorm2d(in_channels)
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+        x = self.deconv(x)
+        x = self.bn(x)
+        x = self.relu(x)
+        return x
+
+
+class CrowdCountingSwin(nn.Module):
+    def __init__(self):
+        super().__init__()
+        # Model is trained on 224x224 patches.
+        self.base_model = timm.create_model(
+            'swin_base_patch4_window7_224',
+            pretrained=True,
+            num_classes=0,
+            img_size=(224, 224)
+        )
+        self.head = nn.Linear(self.base_model.num_features, 5)
+        self.upsample = LearnableUpsample(in_channels=self.base_model.num_features)
+
+    def forward(self, x):
+        B = x.size(0)
+        # Expected input: [B, 3, 224, 224]. Output from backbone: [B, 7, 7, 1024].
+        x = self.base_model.forward_features(x)
+        x = x.permute(0, 3, 1, 2)  # [B, 1024, 7, 7]
+        x = self.upsample(x)  # [B, 1024, 28, 28]
+        x = x.permute(0, 2, 3, 1)  # [B, 28, 28, 1024]
+        x = x.reshape(B, 28 * 28, -1)  # [B, 784, 1024]
+        logits = self.head(x)  # [B, 784, 5]
+        return logits
+
+
+# Load the trained model checkpoint.
+model = CrowdCountingSwin().to(device)
+ckpt_files = glob.glob("best_vit_model_*_*.pth")
+if ckpt_files:
+    ckpt = ckpt_files[0]
+    print(f"Loading checkpoint from {ckpt}")
+    model.load_state_dict(torch.load(ckpt, map_location=device))
+else:
+    print("No checkpoint found!")
+model.eval()
+
+
+# -----------------------------------------------------------------------------
+# Process a Single Frame
+# -----------------------------------------------------------------------------
+def process_frame(model, frame, device, density_threshold=0.1):
+    """
+    Processes one video frame:
+      - Resizes to 448x672.
+      - Uses the model to predict the density map.
+      - Overlays the total count at the top left.
+      - Draws an 8x8 grid.
+      - Highlights grid cells (in green) where the predicted density exceeds density_threshold.
+
+    Args:
+        model: the trained CrowdCountingSwin model.
+        frame: a frame as a BGR numpy array (from cv2).
+        device: torch device.
+        density_threshold: threshold for highlighting grid cells.
+
+    Returns:
+        vis_frame: the processed frame as a BGR image (numpy array).
+    """
+    # Convert frame (BGR) to RGB and then to PIL image.
+    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    pil_img = Image.fromarray(frame_rgb)
+    # Resize to full evaluation size: 672 (width) x 448 (height)
+    pil_img = pil_img.resize((672, 448), Image.BILINEAR)
+    # Convert to tensor and normalize.
+    img_tensor = to_tensor(pil_img)
+    img_tensor = normalize(img_tensor)
+
+    # Run prediction: get full density prediction.
+    with torch.no_grad():
+        output = predict_full_image(model, img_tensor, device)  # [56*84, 5]
+        probs = torch.softmax(output, dim=-1)
+        counts_range = torch.arange(5, dtype=torch.float32, device=device)
+        density = (probs * counts_range).sum(dim=-1)  # [56*84]
+        density_map = density.cpu().numpy().reshape(56, 84)
+        total_count = density_map.sum()
+
+    # Prepare visualization: working on full image (448x672).
+    vis_frame = np.array(pil_img)  # RGB
+    vis_frame = cv2.cvtColor(vis_frame, cv2.COLOR_RGB2BGR)
+
+    # Draw grid lines every 8 pixels.
+    H, W = 448, 672
+    cell_h, cell_w = 8, 8
+    for x in range(0, W + 1, cell_w):
+        cv2.line(vis_frame, (x, 0), (x, H), (0, 0, 255), 1)
+    for y in range(0, H + 1, cell_h):
+        cv2.line(vis_frame, (0, y), (W, y), (0, 0, 255), 1)
+
+    # Highlight cells where predicted density exceeds density_threshold.
+    for i in range(56):
+        for j in range(84):
+            if density_map[i, j] > density_threshold:
+                x = j * cell_w
+                y = i * cell_h
+                cv2.rectangle(vis_frame, (x, y), (x + cell_w, y + cell_h), (0, 255, 0), 1)
+
+    # Overlay total count on top left.
+    cv2.putText(vis_frame, f"Count: {total_count:.1f}", (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
+    return vis_frame
+
+
+# -----------------------------------------------------------------------------
+# Process Video
+# -----------------------------------------------------------------------------
+def process_video(model, input_video_path, output_video_path, device, density_threshold=0.1):
+    cap = cv2.VideoCapture(input_video_path)
     if not cap.isOpened():
-        print(f"Error: Could not open video file {video_path}")
+        print("Error opening video file!")
         return
 
-    # Get video properties
+    # Get video properties.
     fps = cap.get(cv2.CAP_PROP_FPS)
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    # We will output frames at the evaluation size: 672x448.
+    out_width, out_height = 672, 448
+    fourcc = cv2.VideoWriter_fourcc(*'XVID')
+    out = cv2.VideoWriter(output_video_path, fourcc, fps, (out_width, out_height))
 
-    # Create a VideoWriter object to save the output
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
-    exemplar_dir = "NWPU_60/examplars"  # Change to your exemplars directory
-
-    # Load exemplars (you'll need to replace this with your actual exemplars)
-    exemplars = load_exemplars(exemplar_dir, num_exemplars=3, transform=exemplar_transform)
-
-    # Set scales for exemplars (adjust as needed)
-    scales = torch.ones((1, 3, 2), dtype=torch.float32) * (64 / max(width, height))
-
-    # Process each frame
-    frame_count = 0
+    pbar = tqdm(total=frame_count, desc="Processing Video")
     while True:
         ret, frame = cap.read()
         if not ret:
             break
-
-        # Convert frame to PIL Image for processing
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        pil_image = Image.fromarray(frame_rgb)
-
-        # Process the frame
-        with torch.no_grad():
-            # Transform image
-            img_tensor = transform(pil_image).unsqueeze(0).to(device)
-            exemplars_tensor = exemplars.to(device)
-            scales_tensor = scales.to(device)
-
-            # Get model prediction
-            inputs = [img_tensor, exemplars_tensor, scales_tensor]
-            pred_density = model(inputs)
-
-            # Calculate count from density map
-            pred_count = int(round(pred_density.sum().item() / 360))
-
-            # Convert density map to heatmap for visualization
-            density_map = pred_density.squeeze(0).cpu().numpy()
-            density_map_normalized = (density_map - density_map.min()) / (density_map.max() - density_map.min() + 1e-8)
-            density_map_normalized = cv2.resize(density_map_normalized, (width, height))
-
-            # Convert to colormap
-            heatmap = cv2.applyColorMap((density_map_normalized * 255).astype(np.uint8), cv2.COLORMAP_JET)
-
-            # Blend original frame with heatmap
-            alpha = 0.5  # Transparency factor
-            blended = cv2.addWeighted(frame, 1 - alpha, heatmap, alpha, 0)
-
-            # Add count text to frame
-            font = cv2.FONT_HERSHEY_SIMPLEX
-            cv2.putText(blended, f"Count: {pred_count}", (30, 60), font, 2, (255, 255, 255), 5)
-            cv2.putText(blended, f"Count: {pred_count}", (30, 60), font, 2, (0, 0, 0), 2)
-
-            # Write the frame to output video
-            out.write(blended)
-
-        frame_count += 1
-        if frame_count % 10 == 0:
-            print(f"Processed {frame_count} frames")
-
-    # Release resources
+        processed_frame = process_frame(model, frame, device, density_threshold)
+        out.write(processed_frame)
+        pbar.update(1)
+    pbar.close()
     cap.release()
     out.release()
-    print(f"Video processing complete. Output saved to {output_path}")
+    print(f"Processed video saved to {output_video_path}")
 
 
-def load_exemplars(exemplar_dir, num_exemplars=3, transform=None):
-    """
-    Load exemplar images for the crowd counting model.
-
-    Args:
-        exemplar_dir: Directory containing exemplar images
-        num_exemplars: Number of exemplars to load
-        transform: Transform to apply to exemplars
-
-    Returns:
-        Tensor containing exemplar images
-    """
-    # Replace this with your actual loading logic
-    # This is a placeholder implementation
-    import os
-    from PIL import Image
-
-    exemplar_files = os.listdir(exemplar_dir)[:num_exemplars]
-    exemplars = []
-
-    for file in exemplar_files:
-        try:
-            ex_path = os.path.join(exemplar_dir, file)
-            ex = Image.open(ex_path).convert('RGB')
-            if transform:
-                ex = transform(ex)
-            exemplars.append(ex)
-        except Exception as e:
-            print(f"Error loading exemplar {file}: {e}")
-
-    # If we don't have enough exemplars, create dummy ones
-    if len(exemplars) < num_exemplars:
-        dummy = torch.zeros((3, 64, 64))
-        while len(exemplars) < num_exemplars:
-            exemplars.append(dummy)
-
-    # Stack exemplars
-    return torch.stack(exemplars).unsqueeze(0)  # Add batch dimension
-
-
-def main():
-    # Set device
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
-
-    # Define transforms (same as in your training code)
-    transform = transforms.Compose([
-        transforms.Resize((384, 384)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                             std=[0.229, 0.224, 0.225])
-    ])
-
-    exemplar_transform = transforms.Compose([
-        transforms.Resize((64, 64)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                             std=[0.229, 0.224, 0.225])
-    ])
-
-    # Initialize model
-    model = CACVIT(patch_size=16, embed_dim=768, depth=12, num_heads=12,
-                   decoder_embed_dim=512, decoder_depth=3, decoder_num_heads=16,
-                   mlp_ratio=4, norm_layer=partial(nn.LayerNorm, eps=1e-6))
-
-    # Load model weights
-    checkpoint = torch.load("YCV142.pth")
-    model.load_state_dict(checkpoint['model_state_dict'])
-    model = model.to(device)
-    model.eval()
-
-    # Define input and output paths
-    video_path = "10 to 20 people.MOV"  # Change this to your input video path
-    output_path = "output_crowd_counting.mp4"
-    exemplar_dir = "NWPU_60/examplars"  # Change to your exemplars directory
-
-    # Process the video
-    process_video(video_path, output_path, model, device, transform, exemplar_transform)
-
-
+# -----------------------------------------------------------------------------
+# Main
+# -----------------------------------------------------------------------------
 if __name__ == "__main__":
-    main()
+    input_video_path = "10 to 20 people.MOV"  # Replace with your input video file path.
+    output_video_path = "output_video.mp4"
+    process_video(model, input_video_path, output_video_path, device, density_threshold=0.1)
