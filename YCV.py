@@ -19,6 +19,7 @@ from geomloss import SamplesLoss
 import torch.nn.functional as F
 import random
 
+
 #############################################
 # Dataset Definition
 #############################################
@@ -43,8 +44,8 @@ class CrowdCountingLoss(nn.Module):
         density_loss = F.mse_loss(pred_map, gt_blur_map)
 
         # Scale counts appropriately
-        pred_count = pred_map.sum(dim=[1, 2, 3])/360
-        gt_count = gt_map.sum(dim=[1, 2, 3])/360
+        pred_count = pred_map.sum(dim=[1, 2, 3]) / 360
+        gt_count = gt_map.sum(dim=[1, 2, 3]) / 360
 
         count_loss = F.l1_loss(pred_count, gt_count)
 
@@ -55,6 +56,7 @@ class CrowdCountingLoss(nn.Module):
         spatial_loss = torch.mean(self.sinkhorn(pred_map, gt_map))
 
         return density_loss + count_loss + self.alpha * spatial_loss
+
 
 #############################################
 # Modified Training Dataset
@@ -80,7 +82,7 @@ class CrowdCountingDataset(Dataset):
         self.exemplar_transform = exemplar_transform
         self.num_exemplars = num_exemplars
         self.resize_shape = resize_shape  # (width, height)
-        self.crop_size = crop_size        # (crop_width, crop_height)
+        self.crop_size = crop_size  # (crop_width, crop_height)
 
         self.img_names = [f for f in os.listdir(img_dir) if f.endswith('.jpg')]
 
@@ -131,7 +133,6 @@ class CrowdCountingDataset(Dataset):
             print(img_path)
             print(gt_path)
 
-
         # Compute full density map for the resized image (optional: you could generate a density map per crop instead)
         full_density = self.generate_density_map((new_h, new_w), scaled_locations)
         full_density = full_density.astype(np.float32)  # as before
@@ -142,13 +143,13 @@ class CrowdCountingDataset(Dataset):
         top = crop_r * crop_h
         image_crop = image_resized.crop((left, top, left + crop_w, top + crop_h))
         # Crop density map accordingly
-        density_crop = full_density[top:top+crop_h, left:left+crop_w]
+        density_crop = full_density[top:top + crop_h, left:left + crop_w]
 
         # Adjust annotation coordinates to the crop:
         # Keep only points within the crop, and subtract the crop offset.
         crop_points = []
         for (x, y) in scaled_locations:
-            if left <= x < left+crop_w and top <= y < top+crop_h:
+            if left <= x < left + crop_w and top <= y < top + crop_h:
                 crop_points.append((x - left, y - top))
         # Optionally, if no points fall inside, you can still return an empty list.
         # For Bayesian loss, an empty list might be handled specially.
@@ -169,7 +170,8 @@ class CrowdCountingDataset(Dataset):
                 dummy_ex = Image.fromarray(np.zeros((64, 64, 3), dtype=np.uint8))
                 exemplars = [dummy_ex] * self.num_exemplars
             else:
-                exemplars = exemplars * (self.num_exemplars // len(exemplars)) + exemplars[:self.num_exemplars % len(exemplars)]
+                exemplars = exemplars * (self.num_exemplars // len(exemplars)) + exemplars[
+                                                                                 :self.num_exemplars % len(exemplars)]
         elif len(exemplars) > self.num_exemplars:
             exemplars = exemplars[:self.num_exemplars]
 
@@ -181,7 +183,7 @@ class CrowdCountingDataset(Dataset):
             image_crop = self.transform(image_crop)  # (C, 384, 384)
         if self.exemplar_transform:
             exemplars = torch.stack([self.exemplar_transform(ex) for ex in exemplars])
-        density_crop = torch.from_numpy(density_crop).float()*360
+        density_crop = torch.from_numpy(density_crop).float() * 360
 
         return image_crop, density_crop, exemplars, scales, len(crop_points), scaled_locations
 
@@ -207,6 +209,7 @@ class CrowdCountingDataset(Dataset):
             density_map[y1:y2, x1:x2] += kernel[ky1:ky2, kx1:kx2]
         return density_map
 
+
 def gaussian_kernel(kernel_size=15, sigma=4):
     ax = np.arange(-kernel_size // 2 + 1, kernel_size // 2 + 1)
     xx, yy = np.meshgrid(ax, ax)
@@ -214,12 +217,11 @@ def gaussian_kernel(kernel_size=15, sigma=4):
     return kernel / np.sum(kernel)
 
 
-
 #############################################
 # Transforms
 #############################################
 transform = transforms.Compose([
-    transforms.Resize((384, 384)),
+    transforms.Resize((640, 640)),
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.485, 0.456, 0.406],
                          std=[0.229, 0.224, 0.225])
@@ -231,8 +233,6 @@ exemplar_transform = transforms.Compose([
     transforms.Normalize(mean=[0.485, 0.456, 0.406],
                          std=[0.229, 0.224, 0.225])
 ])
-
-
 
 
 class CACVIT(nn.Module):
@@ -559,8 +559,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+
 class CrowdCountingLoss(nn.Module):
-    def __init__(self, alpha=0.00000036, beta=0.00008, sinkhorn_blur=0.2, density_scale=10, epsilon=0.01, sinkhorn_iters=20):
+    def __init__(self, alpha=0.00000036, beta=0.00008, sinkhorn_blur=0.2, density_scale=10, epsilon=0.01,
+                 sinkhorn_iters=20):
         super().__init__()
         self.alpha = alpha
         self.beta = beta
@@ -598,7 +600,6 @@ class CrowdCountingLoss(nn.Module):
         transport_cost = torch.sum(torch.exp((u[:, None] + v[None, :] - cost_matrix) / self.epsilon) * cost_matrix)
         return transport_cost
 
-
     def forward(self, pred_map, gt_map, gt_blur_map, pred_count, gt_count):
         pred_count = torch.tensor(pred_count, dtype=torch.float32, device=pred_map.device).view(1)
         gt_count = torch.tensor(gt_count, dtype=torch.float32, device=pred_map.device).view(1)
@@ -614,8 +615,7 @@ class CrowdCountingLoss(nn.Module):
         sinkhorn_loss = self.sinkhorn_loss(pred_map, gt_map)
 
         # Final loss
-        return self.beta*density_loss + self.beta*count_loss + self.beta*self.alpha * sinkhorn_loss
-
+        return self.beta * density_loss + self.beta * count_loss + self.beta * self.alpha * sinkhorn_loss
 
 
 #############################################
@@ -637,8 +637,8 @@ if __name__ == '__main__':
 
     # Initialize model
     model = CACVIT(patch_size=16, embed_dim=768, depth=12, num_heads=12,
-        decoder_embed_dim=512, decoder_depth=3, decoder_num_heads=16,
-        mlp_ratio=4, norm_layer=partial(nn.LayerNorm, eps=1e-6))
+                   decoder_embed_dim=512, decoder_depth=3, decoder_num_heads=16,
+                   mlp_ratio=4, norm_layer=partial(nn.LayerNorm, eps=1e-6))
     model = model.to(device)
     # Dataset paths (adjust these paths as necessary)
     train_img_dir = 'NWPU_60/img'
@@ -653,14 +653,14 @@ if __name__ == '__main__':
     train_dataset = CrowdCountingDataset(
         train_img_dir, train_gt_dir, exemplars_dir,
         transform=transform, exemplar_transform=exemplar_transform,
-        num_exemplars=3, resize_shape=(384, 384), crop_size=(384, 384)
+        num_exemplars=3, resize_shape=(640, 640), crop_size=(640, 640)
     )
     train_loader = DataLoader(train_dataset, batch_size=1, shuffle=True, num_workers=2, collate_fn=custom_collate_fn)
 
     test_dataset = CrowdCountingDataset(
         test_img_dir, test_gt_dir, exemplars_dir,
         transform=transform, exemplar_transform=exemplar_transform,
-        num_exemplars=3, resize_shape=(384, 384), crop_size=(384, 384)
+        num_exemplars=3, resize_shape=(640, 640), crop_size=(640, 640)
     )
     test_loader = DataLoader(test_dataset, batch_size=1, shuffle=True, num_workers=0, collate_fn=custom_collate_fn)
 
@@ -718,9 +718,9 @@ if __name__ == '__main__':
             # Resize ground truth density map if needed
             gt_density_resized = F.interpolate(gt_density.unsqueeze(1), size=(384, 384), mode='bilinear',
                                                align_corners=False).squeeze(1)
-            pred_count = pred_density.cpu().detach().numpy().sum()/360
-            
-            loss = criterion(pred_density,gt_map, gt_density_resized,pred_count, gt_count)
+            pred_count = pred_density.cpu().detach().numpy().sum() / 360
+
+            loss = criterion(pred_density, gt_map, gt_density_resized, pred_count, gt_count)
 
             loss.backward()
             optimizer.step()
@@ -744,7 +744,7 @@ if __name__ == '__main__':
             saved_checkpoints.append(checkpoint_filename)
 
             # If more than 3 checkpoints exist, delete the oldest one
-            if len(saved_checkpoints) > 1 :
+            if len(saved_checkpoints) > 1:
                 oldest_checkpoint = saved_checkpoints.pop(0)
                 if os.path.exists(oldest_checkpoint):
                     os.remove(oldest_checkpoint)
@@ -766,21 +766,19 @@ if __name__ == '__main__':
                     output_density_np = output_density.squeeze(0).cpu().numpy()
                     gt_density_np = test_gt_density.squeeze(0).cpu().numpy()
 
-                    pred_count = output_density.cpu().detach().numpy().sum()/360
+                    pred_count = output_density.cpu().detach().numpy().sum() / 360
                     gt_density_resized = F.interpolate(test_gt_density.unsqueeze(1), size=(384, 384), mode='bilinear',
-                                                    align_corners=False).squeeze(1)
+                                                       align_corners=False).squeeze(1)
 
                     loss = abs(pred_count - gt_count)
                     total_mae_loss += loss
-                    total_mape_loss += (loss/gt_count)
+                    total_mape_loss += (loss / gt_count)
 
                     if sampled_image is None and random.random() < 0.1:
                         sampled_image = (test_img, output_density.cpu(), gt_count, pred_count)
 
-
-
                 avg_eval_loss = total_mae_loss / len(test_loader)
-                avg_mape_loss = total_mape_loss/ len(test_loader)
+                avg_mape_loss = total_mape_loss / len(test_loader)
                 print(f"MAE: {avg_eval_loss}")
                 print(f"MAPE: {avg_mape_loss}")
                 if avg_eval_loss < best_loss:
