@@ -613,7 +613,7 @@ class CrowdCountingLoss(nn.Module):
         sinkhorn_loss = self.sinkhorn_loss(pred_map, gt_map)
 
         # Final loss
-        return self.beta*(density_loss + count_loss + self.alpha * sinkhorn_loss)
+        return self.beta*density_loss + self.beta*count_loss + self.beta*self.alpha * sinkhorn_loss
 
 
 
@@ -621,6 +621,16 @@ class CrowdCountingLoss(nn.Module):
 # Training & Evaluation Setup
 #############################################
 if __name__ == '__main__':
+    best_loss_file = "best_eval_loss.txt"
+    if os.path.exists(best_loss_file):
+        with open(best_loss_file, "r") as f:
+            try:
+                best_loss = float(f.read().strip())
+            except ValueError:
+                best_loss = float("inf")
+    else:
+        best_loss = float("inf")
+
     torch.multiprocessing.freeze_support()
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -748,18 +758,6 @@ if __name__ == '__main__':
                     print(f"Deleted old checkpoint: {oldest_checkpoint}")
 
             # --- Evaluation & Visualization on 1 Test Image ---
-            best_loss_file = "best_eval_loss.txt"
-
-            if os.path.exists(best_loss_file):
-                with open(best_loss_file, "r") as f:
-                    try:
-                        best_loss = float(f.read().strip())
-                    except ValueError:
-                        best_loss = float("inf")
-            else:
-                best_loss = float("inf")
-
-
             model.eval()
             with torch.no_grad():
                 sample = next(iter(test_loader))
