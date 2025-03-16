@@ -17,7 +17,6 @@ from Blocks import Block
 from pos_embed import get_2d_sincos_pos_embed
 from geomloss import SamplesLoss
 import torch.nn.functional as F
-import random
 
 #############################################
 # Dataset Definition
@@ -618,203 +617,76 @@ class CrowdCountingLoss(nn.Module):
 
 
 
-#############################################
-# Training & Evaluation Setup
-#############################################
-if __name__ == '__main__':
-    best_loss_file = "best_eval_loss.txt"
-    if os.path.exists(best_loss_file):
-        with open(best_loss_file, "r") as f:
-            try:
-                best_loss = float(f.read().strip())
-            except ValueError:
-                best_loss = float("inf")
-    else:
-        best_loss = float("inf")
+import torch
+import torch.nn.functional as F
+import os
+from torch.utils.data import DataLoader
+from functools import partial
+import torch.nn as nn
+from PIL import Image
+import torchvision.transforms as transforms
 
-    torch.multiprocessing.freeze_support()
+from YCV import CACVIT  # Assuming your model class is in YCV.py
+
+def evaluate_model(model, test_loader, device):
+    model.eval()
+    total_mae = 0
+    with torch.no_grad():
+        for batch_idx, (test_img, test_gt_density, test_exemplars, test_scales, gt_count, gt_map) in enumerate(test_loader):
+            test_img = test_img.to(device)
+            test_gt_density = test_gt_density.to(device)
+            test_exemplars = test_exemplars.to(device)
+            test_scales = test_scales.to(device)
+
+            output_density = model([test_img, test_exemplars, test_scales])
+            pred_count = output_density.cpu().detach().numpy().sum() / 360  # Adjust scale factor if needed
+
+            mae = abs(pred_count - gt_count.item())
+            total_mae += mae
+
+            print(f"Image {batch_idx + 1}: Predicted Count = {pred_count:.2f}, GT Count = {gt_count.item()}, MAE = {mae:.2f}")
+    
+    avg_mae = total_mae / len(test_loader)
+    print(f"Mean Absolute Error (MAE) over {len(test_loader)} images: {avg_mae:.2f}")
+
+def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
 
-    # Initialize model
+    transform = transforms.Compose([
+        transforms.Resize((384, 384)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                             std=[0.229, 0.224, 0.225])
+    ])
+    
+    exemplar_transform = transforms.Compose([
+        transforms.Resize((64, 64)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                             std=[0.229, 0.224, 0.225])
+    ])
+
     model = CACVIT(patch_size=16, embed_dim=768, depth=12, num_heads=12,
-        decoder_embed_dim=512, decoder_depth=3, decoder_num_heads=16,
-        mlp_ratio=4, norm_layer=partial(nn.LayerNorm, eps=1e-6))
-    model = model.to(device)
-    # Dataset paths (adjust these paths as necessary)
-    train_img_dir = 'NWPU_60/img'
-    train_gt_dir = 'NWPU_60/mat'
-    exemplars_dir = 'NWPU_60/examplars'
-    test_img_dir = 'NWPU_60/val_img'
-    # test_img_dir = 'datasets/partB/test_data/images'
-    test_gt_dir = 'NWPU_60/val_mat'
-    # test_gt_dir = 'datasets/partB/test_data/ground_truth'
-
-    # Create DataLoaders for training and evaluation
-    train_dataset = CrowdCountingDataset(
-        train_img_dir, train_gt_dir, exemplars_dir,
-        transform=transform, exemplar_transform=exemplar_transform,
-        num_exemplars=3, resize_shape=(384, 384), crop_size=(384, 384)
-    )
-    train_loader = DataLoader(train_dataset, batch_size=1, shuffle=True, num_workers=2, collate_fn=custom_collate_fn)
-
+                   decoder_embed_dim=512, decoder_depth=3, decoder_num_heads=16,
+                   mlp_ratio=4, norm_layer=partial(nn.LayerNorm, eps=1e-6))
+    
+    checkpoint = torch.load("YCV12.pth", map_location=device)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    model.to(device)
+    model.eval()
+    
+    test_img_dir = 'datasets/partB/test_data/images'
+    test_gt_dir = 'datasets/partB/test_data/ground_truth'
+    
     test_dataset = CrowdCountingDataset(
-        test_img_dir, test_gt_dir, exemplars_dir,
+        test_img_dir, test_gt_dir, None,
         transform=transform, exemplar_transform=exemplar_transform,
-        num_exemplars=3, resize_shape=(384, 384), crop_size=(384, 384)
+        num_exemplars=3, resize_shape=(576, 384), crop_size=(576, 384)
     )
-    test_loader = DataLoader(test_dataset, batch_size=1, shuffle=True, num_workers=0, collate_fn=custom_collate_fn)
+    test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=2, collate_fn=custom_collate_fn)
+    
+    evaluate_model(model, test_loader, device)
 
-    # Optimizer and loss function
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
-
-    # criterion = nn.MSELoss()
-    criterion = CrowdCountingLoss()
-    # criterion = CombinedLoss(lambda_mse=0.5, lambda_ssim=0.5)
-
-    num_epochs = 300
-    saved_checkpoints = []
-    # Find all checkpoint files matching the pattern
-    checkpoint_files = glob.glob("YCV*.pth")
-
-    if checkpoint_files:
-        def get_epoch_from_filename(filename):
-            try:
-                return int(filename[1].split(".pth")[0])
-            except ValueError:
-                return -1
-
-
-        # Get the checkpoint with the highest epoch number
-        latest_checkpoint = max(checkpoint_files, key=get_epoch_from_filename)
-        checkpoint = torch.load(latest_checkpoint)
-
-        # If your checkpoint is a dictionary containing the state dicts and epoch info:
-        model.load_state_dict(checkpoint['model_state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        start_epoch = checkpoint['epoch'] + 1
-
-        print(f"Resuming training from epoch {start_epoch} using checkpoint {latest_checkpoint}")
-    else:
-        start_epoch = 1
-        print("No checkpoint found. Starting training from scratch.")
-    print("Starting training...")
-
-    # model.load_state_dict(torch.load("best_model.pth", weights_only = False)['model'])
-
-    # optimizer.load_state_dict(torch.load("best_model.pth")[['optimizer']])
-    for epoch in range(start_epoch, num_epochs + 1):
-        model.train()
-        total_loss = 0.0
-        for batch_idx, (images, gt_density, exemplars, scales, gt_count, gt_map) in enumerate(train_loader):
-            images = images.to(device)
-            gt_density = gt_density.to(device)
-            exemplars = exemplars.to(device)
-            scales = scales.to(device)
-
-            optimizer.zero_grad()
-            inputs = [images, exemplars, scales]
-            pred_density = model(inputs)  # (B, 384, 384)
-
-            # Resize ground truth density map if needed
-            gt_density_resized = F.interpolate(gt_density.unsqueeze(1), size=(384, 384), mode='bilinear',
-                                               align_corners=False).squeeze(1)
-            pred_count = pred_density.cpu().detach().numpy().sum()/360
-            
-            loss = criterion(pred_density,gt_map, gt_density_resized,pred_count, gt_count)
-
-            loss.backward()
-            optimizer.step()
-
-            total_loss += loss.item()
-            if (batch_idx + 1) % 10 == 0:
-                print(
-                    f"Epoch [{epoch}/{num_epochs}] Batch [{batch_idx + 1}/{len(train_loader)}] Loss: {loss.item():.6f}")
-
-        avg_loss = total_loss / len(train_loader)
-        print(f"Epoch [{epoch}/{num_epochs}] Average Loss: {avg_loss:.6f}")
-        if epoch % 1 == 0:
-            checkpoint_data = {
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-            }
-            checkpoint_filename = f"YCV{epoch}.pth"
-            torch.save(checkpoint_data, checkpoint_filename)
-            print(f"Saved checkpoint: {checkpoint_filename}")
-            saved_checkpoints.append(checkpoint_filename)
-
-            # If more than 3 checkpoints exist, delete the oldest one
-            if len(saved_checkpoints) > 1 :
-                oldest_checkpoint = saved_checkpoints.pop(0)
-                if os.path.exists(oldest_checkpoint):
-                    os.remove(oldest_checkpoint)
-                    print(f"Deleted old checkpoint: {oldest_checkpoint}")
-
-            # --- Evaluation & Visualization on 1 Test Image ---
-            model.eval()
-            total_mae_loss = 0.0
-            total_mape_loss = 0.0
-            with torch.no_grad():
-                sampled_image = None
-                for sample in test_loader:
-                    test_img, test_gt_density, test_exemplars, test_scales, gt_count, gt_map = sample
-                    test_img = test_img.to(device)
-                    test_gt_density = test_gt_density.to(device)
-                    test_exemplars = test_exemplars.to(device)
-                    test_scales = test_scales.to(device)
-                    output_density = model([test_img, test_exemplars, test_scales])
-                    output_density_np = output_density.squeeze(0).cpu().numpy()
-                    gt_density_np = test_gt_density.squeeze(0).cpu().numpy()
-
-                    pred_count = output_density.cpu().detach().numpy().sum()/360
-                    gt_density_resized = F.interpolate(test_gt_density.unsqueeze(1), size=(384, 384), mode='bilinear',
-                                                    align_corners=False).squeeze(1)
-
-                    loss = abs(pred_count - gt_count)
-                    total_mae_loss += loss
-                    total_mape_loss += (loss/gt_count)
-
-                    if sampled_image is None and random.random() < 0.1:
-                        sampled_image = (test_img, output_density.cpu(), gt_count, pred_count)
-
-
-
-                avg_eval_loss = total_mae_loss / len(test_loader)
-                avg_mape_loss = total_mape_loss/ len(test_loader)
-                print(f"MAE: {avg_eval_loss}")
-                print(f"MAPE: {avg_mape_loss}")
-                if avg_eval_loss < best_loss:
-                    best_loss = avg_eval_loss
-                    torch.save(model.state_dict(), "YCV_best.pth")
-                    print(f"New best model saved with loss: {best_loss}")
-
-                    # Update best loss file
-                    with open(best_loss_file, "w") as f:
-                        f.write(f"{best_loss}")
-
-                if sampled_image:
-                    test_img, output_density, gt_count, pred_count = sampled_image
-
-                    inv_normalize = transforms.Normalize(
-                        mean=[-0.485 / 0.229, -0.456 / 0.224, -0.406 / 0.225],
-                        std=[1 / 0.229, 1 / 0.224, 1 / 0.225]
-                    )
-                    disp_img = test_img.squeeze(0).cpu()
-                    disp_img = inv_normalize(disp_img)
-                    disp_img = torch.clamp(disp_img, 0, 1)
-                    disp_img = transforms.ToPILImage()(disp_img)
-
-                    output_density_np = output_density.squeeze(0).numpy()
-
-                    fig, ax = plt.subplots(figsize=(8, 8))
-                    ax.imshow(disp_img)
-                    ax.imshow(output_density_np, cmap='Reds', alpha=0.5)  # Red overlay with transparency
-                    ax.set_title(f"Pred Count: {pred_count:.2f}, GT Count: {gt_count}", fontsize=14)
-                    ax.axis('off')
-
-                    plt.tight_layout()
-                    plt.savefig("YCV_VIS.png")
-
-    # Save the final model
-    torch.save(model.state_dict(), 'YCV.pth')
-    print("Training completed and model saved as 'YCV.pth'")
+if __name__ == "__main__":
+    main()
