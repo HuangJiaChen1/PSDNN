@@ -671,7 +671,7 @@ def main():
                    decoder_embed_dim=512, decoder_depth=3, decoder_num_heads=16,
                    mlp_ratio=4, norm_layer=partial(nn.LayerNorm, eps=1e-6))
     
-    checkpoint = torch.load("YCV12.pth", map_location=device)
+    checkpoint = torch.load("YCV93.pth", map_location=device)
     model.load_state_dict(checkpoint['model_state_dict'])
     model.to(device)
     model.eval()

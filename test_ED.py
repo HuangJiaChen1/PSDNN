@@ -7,7 +7,7 @@ import torchvision.transforms as transforms
 from PIL import Image
 import matplotlib.pyplot as plt
 from mat4py import loadmat
-from timm_check.models.vision_transformer import PatchEmbed, Block
+from timm.models.vision_transformer import PatchEmbed, Block
 
 # --------------------------
 # Helper functions: Gaussian kernel and density map generation
@@ -244,13 +244,13 @@ def inference():
                              std=[0.229, 0.224, 0.225])
     ])
 
-    dataset_root = "datasets/partA"  # Update this path if needed
+    dataset_root = "datasets/partB"  # Update this path if needed
     test_dataset = ShanghaiTechA(root=dataset_root, split='test', transform=transform)
     test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=2)
 
     model = CountingViT().to(device)
     # If you have trained weights, uncomment and update the path:
-    model.load_state_dict(torch.load("ED_sha.pth", map_location=device))
+    model.load_state_dict(torch.load("YCV_best.pth", map_location=device))
     model.eval()
 
     total_mae = 0.0

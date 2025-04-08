@@ -160,13 +160,16 @@ def main():
                    mlp_ratio=4, norm_layer=partial(nn.LayerNorm, eps=1e-6))
 
     # Load model weights
-    checkpoint = torch.load("YCV142.pth")
+    checkpoint = torch.load("YCV93.pth")
+    # checkpoint = torch.load("YCV_best.pth")
     model.load_state_dict(checkpoint['model_state_dict'])
+    # model.load_state_dict(torch.load("YCV_best.pth", map_location=device))
     model = model.to(device)
     model.eval()
 
+
     # Define input and output paths
-    video_path = "10 to 20 people.MOV"  # Change this to your input video path
+    video_path = "MJ2.mov"  # Change this to your input video path
     output_path = "output_crowd_counting.mp4"
     exemplar_dir = "NWPU_60/examplars"  # Change to your exemplars directory
 
